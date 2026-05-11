@@ -6,7 +6,6 @@ Window pruning otomatis saat get_recent_messages().
 Tidak ada session ID, tidak ada index file.
 
 File: storage/sessions/{user_id}.jsonl
-Profile: storage/profiles/{user_id}.json
 
 Format tiap baris:
 {
@@ -20,7 +19,7 @@ Format tiap baris:
 import json
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -40,7 +39,6 @@ class JSONLMemoryManager:
     ):
         self.sessions_dir = Path(sessions_dir)
         self.window_size  = window_size
-
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Paths ──────────────────────────────────────────────────────
@@ -48,12 +46,29 @@ class JSONLMemoryManager:
     def _chat_path(self, user_id: str) -> Path:
         return self.sessions_dir / f"{user_id}.jsonl"
 
+    # ── Internal: baca semua record dari file ──────────────────────
+
+    def _read_all(self, user_id: str) -> list[dict]:
+        p = self._chat_path(user_id)
+        if not p.exists():
+            return []
+        records = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return records
+
     # ── Tulis pesan ────────────────────────────────────────────────
 
     def add_message(self, user_id: str, role: str, content: str):
         """Append satu turn ke file JSONL user."""
         p    = self._chat_path(user_id)
-        turn = self._count_lines(p) + 1
+        turn = len(self._read_all(user_id)) + 1
 
         record = {
             "turn"     : turn,
@@ -69,34 +84,20 @@ class JSONLMemoryManager:
 
     def get_recent_messages(self, user_id: str, n: Optional[int] = None) -> list[dict]:
         """Return N turn terakhir (window). Default = self.window_size."""
-        n = n or self.window_size
-        p = self._chat_path(user_id)
-        if not p.exists():
-            return []
-
-        records = []
-        for line in p.read_text(encoding="utf-8").split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
+        n       = n or self.window_size
+        records = self._read_all(user_id)
         return records[-n:] if len(records) > n else records
 
     def get_all_messages(self, user_id: str) -> list[dict]:
-        return self.get_recent_messages(user_id, n=999_999)
+        return self._read_all(user_id)
 
     # ── Context object ─────────────────────────────────────────────
 
     def get_context(self, user_id: str) -> ConversationContext:
-        messages  = self.get_recent_messages(user_id, n=3)
-        last_user = next((m for m in reversed(messages) if m["role"] == "user"), None)
+        records   = self._read_all(user_id)
+        last_user = next((m for m in reversed(records) if m["role"] == "user"), None)
         topic     = last_user["content"][:80] if last_user else None
-        total     = self._count_lines(self._chat_path(user_id))
-        return ConversationContext(current_topic=topic, message_count=total)
+        return ConversationContext(current_topic=topic, message_count=len(records))
 
     # ── Hapus riwayat ──────────────────────────────────────────────
 
@@ -107,24 +108,16 @@ class JSONLMemoryManager:
             p.unlink()
         p.touch()
 
-
     # ── Stats ──────────────────────────────────────────────────────
 
     def stats(self, user_id: str) -> dict:
-        all_msgs = self.get_all_messages(user_id)
-        recent   = self.get_recent_messages(user_id)
+        all_msgs = self._read_all(user_id)
+        recent   = all_msgs[-self.window_size:] if len(all_msgs) > self.window_size else all_msgs
         return {
             "total_turns" : len(all_msgs),
             "window_turns": len(recent),
             "window_size" : self.window_size,
         }
-
-    # ── Util ───────────────────────────────────────────────────────
-
-    def _count_lines(self, path: Path) -> int:
-        if not path.exists():
-            return 0
-        return sum(1 for l in path.read_text(encoding="utf-8").split("\n") if l.strip())
 
 
 def _now() -> str:

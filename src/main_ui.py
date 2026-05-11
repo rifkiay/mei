@@ -1,7 +1,38 @@
 """
 MEI — AI Personal Assistant
 =============================
-Version 4.5.9
+Version 4.5.15
+
+Perubahan v4.5.15:
+  - FIX: Bug 'ancur' (asisten meniru placeholder [Selesai]). 
+    Menggunakan teks asli yang di-truncate agresif (70 char) agar natural.
+  - MOD: Restore minimal 'PERCAKAPAN TERAKHIR' di System Message (1 pesan, 80 char) 
+    untuk menjaga flow tanpa menyebabkan echo/stale response.
+
+Perubahan v4.5.14:
+  - FIX: Bug stale response (echo). Menghapus redundansi riwayat percakapan 
+    di System Message agar asisten tidak mengulang jawaban lama.
+
+Perubahan v4.5.13:
+  - FIX: Bug tool tidak terpanggil. Mengembalikan function_call + function result 
+    ke history. (Note: Placeholder [Selesai] diuji di sini tapi menyebabkan regresi).
+
+Perubahan v4.5.12:
+  - MOD: Penyatuan logika simpan history (GPU/CPU) agar konsisten menjaga 
+    rantai pemanggilan tool.
+
+Perubahan v4.5.11:
+  - FIX: Bug tool looping. Menyimpan respon asisten ke conv_history agar 
+    asisten tahu turn sebelumnya sudah selesai terjawab.
+
+Perubahan v4.5.10:
+  - FIX: Bug stale response setelah realtime tool use (camera/search → request baru).
+    Strategi bersih: realtime tool turn HANYA menyimpan user message ke conv_history.
+    Assistant response + function result tidak disimpan → LLM tidak membaca
+    konten tool lama di turn berikutnya. Tanpa filter/marker/heuristic apapun.
+  - CLEAN: Hapus PERINGATAN KONTEKS TOOL dari build_system_message().
+  - CLEAN: Hapus anotasi [SISTEM:...] dari _build_messages_to_send().
+
 
 Perubahan v4.5.9:
   - ADD: _store_yesterday_summary_to_chroma() — saat startup, daily summary
@@ -88,6 +119,7 @@ I/O Modes:
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import logging
 
 logging.basicConfig(level=logging.WARNING)
@@ -671,18 +703,15 @@ def build_system_message(
 
     if memory_md.strip():
         msg += f"\n\n{sep}\nPROFIL USER:\n{sep}\n{memory_md.strip()[:mem_max_chars]}"
-    if last_summary.strip():
-        msg += f"\n\n{sep}\nRINGKASAN HARI INI/KEMARIN:\n{sep}\n{last_summary.strip()}"
     if recent_msgs:
         filtered_recent = [
             m for m in recent_msgs
             if not m.get("content", "").startswith("[CATATAN SISTEM:")
-        ][:recent_n]
+        ][:1] # Cukup 1 pesan terakhir untuk trigger flow
         if filtered_recent:
-            msg += f"\n\n{sep}\nPERCAKAPAN TERAKHIR:\n{sep}\n"
+            msg += f"\n\n{sep}\nKONTEKS TERAKHIR:\n{sep}\n"
             for m in filtered_recent:
-                msg += f"[{m.get('role','?').upper()}] {m.get('content','')[:recent_content_ch]}\n"
-    if episodic_hits:
+                msg += f"[{m.get('role','?').upper()}] {m.get('content','')[:80]}\n"
         msg += f"\n\n{sep}\nMEMORI EPISODIK RELEVAN:\n{sep}\n"
         for hit in episodic_hits:
             relevance = round(1 - hit["distance"], 2)
@@ -692,18 +721,7 @@ def build_system_message(
             )
 
     if last_tool_used:
-        msg += (
-            f"\n\n{sep}\nREMINDER TOOL:\n{sep}\n"
-            f"Turn sebelumnya menggunakan tool '{last_tool_used}'.\n"
-            f"ATURAN WAJIB untuk turn ini:\n"
-            f"  1. Jika user membuat request yang membutuhkan data real-time "
-            f"(jadwal, cuaca, timer, foto, pencarian web, dll.), "
-            f"WAJIB panggil tool yang sesuai — JANGAN jawab dari memory atau history.\n"
-            f"  2. Tool '{last_tool_used}' kemungkinan besar dibutuhkan lagi. "
-            f"Panggil dari awal, bukan dari hasil sebelumnya.\n"
-            f"  3. Jangan asumsikan data dari history conversation masih valid "
-            f"untuk request baru.\n"
-        )
+        _dbg(f"build_system_message: last_tool_used={last_tool_used} (tidak diinjek ke prompt)")
 
     msg += f"\n{sep}"
     return msg
@@ -889,8 +907,6 @@ def _build_messages_to_send(
     user_input   : str,
     last_tool    : str | None = None,
 ) -> list[dict]:
-    if last_tool:
-        _dbg(f"_build_messages_to_send: last_tool={last_tool} (reminder di system msg)")
     return conv_history + [{"role": "user", "content": user_input}]
 
 
@@ -1187,10 +1203,11 @@ def _stream_and_speak(
       - on_token(delta) jika tersedia → UI
       - TTS jika voice_out aktif
     """
-    full_response = ""
-    all_messages : list[dict] = []
-    text_buffer  = ""
-    speak_mode   = io_state.voice_out and vs.voice_ok and vs.tts
+    full_response  = ""
+    all_messages  : list[dict] = []
+    text_buffer    = ""
+    speak_mode     = io_state.voice_out and vs.voice_ok and vs.tts
+    _prev_resp_len = 0  # v4.5.9-fix: deteksi tool execution dalam satu turn
 
     print("MEI: ", end="", flush=True)
 
@@ -1232,7 +1249,21 @@ def _stream_and_speak(
                         _dbg(f"on_token error (tool loop fallback): {e}")
                 break
 
-            all_messages = responses
+            all_messages  = responses
+            curr_resp_len = len(responses)
+
+            # v4.5.9-fix: saat tool selesai, responses loncat >1 sekaligus.
+            # Tanpa reset, full_response lama → len(text) <= len(full_response) → delta di-SKIP.
+            if curr_resp_len > _prev_resp_len + 1:
+                last_role = responses[-1].get("role", "")
+                if last_role in ("assistant", None):
+                    if full_response:
+                        print()
+                        print("MEI: ", end="", flush=True)
+                    full_response = ""
+                    _dbg(f"Tool execution: responses {_prev_resp_len}→{curr_resp_len}, reset full_response")
+            _prev_resp_len = curr_resp_len
+
             last = responses[-1]
             if last.get("role") not in ("assistant", None):
                 continue
@@ -1292,7 +1323,7 @@ def _stream_and_speak(
 def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
     s = lt_mem.stats()
     print("\n" + "=" * 60)
-    print("MEI — Personal Assistant v4.5.9")
+    print("MEI — Personal Assistant v4.5.15")
     print("=" * 60)
     print(f"  User        : {USER_ID}")
     print(f"  Short-term  : JSONL window {MEMORY_CONFIG['window_size']} turn")
@@ -1425,6 +1456,8 @@ def _process_turn(
         all_session_msgs        = shared["all_session_msgs"]
         last_used_realtime_tool = shared["last_used_realtime_tool"]
         _last_turn_had_error    = shared["_last_turn_had_error"]
+
+        _dbg(f"[TURN START] history={len(conv_history)} msgs, last_tool={last_used_realtime_tool}")
 
         token_logger.reset()
         if tracker is None:
@@ -1611,25 +1644,38 @@ def _process_turn(
         else:
             shared["last_used_realtime_tool"] = None
 
-        if io_state.use_gpu:
-            new_history_entries = [
-                _compress_function_result(m)
-                for m in all_messages
-                if m.get("role") != "user"
-            ]
-            conv_history.append({"role": "user", "content": user_input})
-            conv_history.extend(new_history_entries)
-        else:
-            conv_history.append({"role": "user", "content": user_input})
-            for m in reversed(all_messages):
-                if m.get("role") == "assistant":
-                    text = _extract_text_content(m.get("content", ""))
-                    if text.strip():
-                        conv_history.append({
-                            "role"   : "assistant",
-                            "content": text[:100],
-                        })
-                        break
+        _dbg(f"last_used_realtime_tool next turn = {shared['last_used_realtime_tool']}")
+
+        _was_realtime_turn = tool_info.get("tool_used") in REALTIME_TOOLS
+        new_history_entries = []
+
+        for _m in all_messages:
+            if _m.get("role") == "user":
+                continue
+            
+            _entry = dict(_m)
+            
+            if _entry.get("role") == "function":
+                _entry = _compress_function_result(_entry)
+                
+            elif _entry.get("role") == "assistant":
+                text = _extract_text_content(_entry.get("content", ""))
+                # Jika ini final response (tanpa function_call/tool_calls)
+                if text and not _entry.get("function_call") and not _entry.get("tool_calls"):
+                    if _was_realtime_turn:
+                        # Truncate sangat pendek untuk mencegah stale response
+                        # tapi tetap menyisakan awal kalimat agar LLM tahu turn sudah selesai.
+                        _entry["content"] = text[:70] + ("..." if len(text) > 70 else "")
+                    elif not io_state.use_gpu:
+                        # Truncate untuk hemat token di CPU
+                        _entry["content"] = text[:80] + "..."
+                    else:
+                        _entry["content"] = text
+                        
+            new_history_entries.append(_entry)
+
+        conv_history.append({"role": "user", "content": user_input})
+        conv_history.extend(new_history_entries)
 
         shared["conversation_history"] = _trim_history(
             conv_history, _get_max_history(io_state.use_gpu)
