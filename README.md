@@ -129,3 +129,5 @@ uv pip install --python .venv\Scripts\python.exe librosa --upgrade
 ## Requirements
 
 Lihat `requirements.txt` untuk daftar lengkap dependencies.
+LM Studio.
+Rekomendasi gunakan GPU RTX 2060 12 GB jika ingin full menggunakan semua fitur.
