@@ -1,15 +1,30 @@
 """
-Async Fact Extractor — MEI v6.2.4
+Async Fact Extractor — MEI v6.3.0
 ==================================
 Pipeline 4-step yang dioptimalkan untuk SLM kecil (Qwen 3 1.7B):
 
-  [1] Rule-based filter     — eliminasi basa-basi SEBELUM kena model apapun
-  [1.5] Recall question filter — eliminasi pertanyaan recall/ingat SEBELUM classifier
-  [2] Classifier            — label via cosine similarity (ST) atau NLI pipeline
-  [3] SLM binary + teks     — HANYA untuk label ambigu
-                              Label jelas (data_pribadi/project) langsung SAVE
-                              Label jelas tidak penting langsung DROP
-  [4] Python routing        — berdasarkan label + should_save → simpan / drop
+  [1]   Rule-based filter     — eliminasi basa-basi SEBELUM kena model apapun
+  [1.5] Recall question filter — eliminasi pertanyaan recall/ingat
+  [1.6] Utility command filter — eliminasi perintah utilitas one-shot (NEW v6.3.0)
+        set timer, cari berita, cek waktu, ambil gambar, dll.
+  [2]   Classifier            — label + confidence via cosine similarity (ST) atau NLI
+  [3]   SLM binary + teks     — HANYA untuk label ambigu ATAU direct-save confidence rendah
+                                Label jelas langsung SAVE (jika confidence ≥ 0.45)
+                                Label jelas tidak penting langsung DROP
+  [4]   Python routing        — berdasarkan label + should_save → simpan / drop
+
+Perubahan dari v6.2.4 (v6.3.0):
+  - ADD: _UTILITY_PATTERNS + _is_utility_command() — Step [1.6] baru.
+    Perintah utilitas one-shot (timer, berita, waktu, kamera, kalender)
+    di-drop sebelum classifier. Fix false save "tanggal?" → pekerjaan,
+    "set timer" → preferensi, "cari berita" → pekerjaan.
+  - MOD: _classify_with_st() dan _classify_with_nli() return tuple[str, float]
+    (label, confidence) — sebelumnya hanya return str.
+  - ADD: _DIRECT_SAVE_MIN_CONFIDENCE = 0.45 — threshold confidence untuk
+    direct save. Di bawah nilai ini → redirect ke SLM check.
+  - MOD: _process() — jalur 2 cek confidence sebelum direct save.
+  - MOD: _LABEL_CANDIDATES — definisi "pekerjaan" dipersempit, "tidak_penting"
+    diperluas include perintah utilitas.
 
 Perubahan dari v6.2.3 (PATCH v6.2.4):
   - FIX: Prefix [USER] tidak lagi ikut tersimpan ke ChromaDB.
@@ -139,11 +154,65 @@ def _is_recall_question(messages: list[dict]) -> bool:
     return bool(_RECALL_QUESTION_PATTERNS.match(last))
 
 
+# ══════════════════════════════════════════════════════════════════
+# STEP [1.6] — UTILITY COMMAND FILTER (v6.3.0)
+# ══════════════════════════════════════════════════════════════════
+
+_UTILITY_PATTERNS = re.compile(
+    r"^("
+    # Timer
+    r"(tolong\s+|coba\s+)?(set|buat|mulai|pasang|tambah)\s+timer|"
+    r"(batalkan|cancel|stop)\s+timer|"
+    r"(list|tampilkan|cek)\s+timer|"
+    # Berita / search
+    r"(carikan|cari|ambil|tampilkan|kasih|kasih tau|cek)\s+berita|"
+    r"ada\s+berita\s+(apa|terbaru|hari ini)|"
+    r"berita\s+(hari ini|terbaru|terkini)|"
+    r"(tolong\s+)?cari(kan)?\s+(info|informasi|artikel|tutorial|cara)|"
+    # Waktu / tanggal
+    r"(jam|pukul)\s+berapa(\s+sekarang)?[\?]*|"
+    r"sekarang\s+(jam|pukul)\s+berapa[\?]*|"
+    r"(tanggal|hari)\s+(berapa|apa|ini)[\?]*|"
+    r"tanggal[\?]*$|"
+    # Kamera
+    r"(tolong\s+)?(ambil|foto|capture|analisa|analisis)\s+(gambar|foto|kamera|image)|"
+    r"(tolong\s+)?ambil\s+gambar|"
+    # Kalender utilitas
+    r"(cek|tampilkan|lihat)\s+(jadwal|event|kalender|agenda)|"
+    r"(ada\s+)?(event|jadwal)\s+(apa|hari ini|besok|minggu ini)|"
+    # Cuaca
+    r"cuaca\s+(hari ini|sekarang|di\s+\w+)|"
+    r"(bagaimana|gimana)\s+cuaca|"
+    # Notifikasi
+    r"(tolong\s+)?(set|buat|jadwalkan)\s+notifikasi|"
+    r"(batalkan|cancel)\s+notifikasi"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_utility_command(messages: list[dict]) -> bool:
+    """
+    Deteksi perintah utilitas one-shot: set timer, cari berita, cek jadwal,
+    ambil gambar, tanya waktu/tanggal.
+
+    Perintah-perintah ini tidak mengandung informasi personal yang perlu
+    disimpan ke long-term memory — langsung drop.
+
+    Step [1.6]: dijalankan setelah recall filter, sebelum classifier.
+    """
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    if not user_msgs:
+        return False
+    last = (user_msgs[-1].get("content") or "").strip()
+    return bool(_UTILITY_PATTERNS.match(last))
+
+
 # ── Label routing ──────────────────────────────────────────────────
 
-_NO_SAVE_LABELS     = {"tidak_penting"}
+_NO_SAVE_LABELS     = {"tidak_penting", "lainnya"}
 _DIRECT_SAVE_LABELS = {"data_pribadi", "project", "pekerjaan", "preferensi"}
-_AMBIGUOUS_LABELS   = {"teknis", "pengalaman", "lainnya"}
+_AMBIGUOUS_LABELS   = {"teknis", "pengalaman"}
 
 
 def _rule_based_filter(messages: list[dict]) -> bool:
@@ -172,24 +241,52 @@ def _rule_based_filter(messages: list[dict]) -> bool:
 
 _LABEL_CANDIDATES = [
     "nama pengguna, nomor HP, email, alamat, atau data identitas personal",
-    "jadwal kerja, meeting rutin, reminder pekerjaan, atau aktivitas profesional sehari-hari — bukan proyek spesifik",
+    (
+        "jadwal kerja terjadwal, meeting rutin berulang, atau pengingat tugas "
+        "profesional spesifik — BUKAN query informasi umum, BUKAN perintah "
+        "satu-kali seperti cek berita atau set timer"
+    ),
     "proyek software spesifik yang sedang dikerjakan: sprint planning, arsitektur sistem, code review project sendiri",
-    "pertanyaan atau diskusi teknis umum: Docker, JWT, REST API, GraphQL, Node.js — bukan tentang proyek sendiri",
-    "preferensi jadwal, kebiasaan kerja, atau cara kerja yang disukai pengguna. Contoh: prefer meeting pagi, standup rutin",
+    (
+        "pertanyaan atau diskusi teknis umum mendalam: Docker, JWT, REST API, "
+        "GraphQL, Node.js — diskusi panjang, bukan pencarian satu-kali"
+    ),
+    (
+        "preferensi jadwal, kebiasaan kerja, atau cara kerja yang disukai "
+        "pengguna yang dinyatakan secara eksplisit — BUKAN perintah one-shot"
+    ),
     "riwayat karir, pengalaman kerja masa lalu, atau portfolio — bukan proyek yang sedang berjalan sekarang",
-    "hal random, aktivitas non-kerja, pertanyaan singkat, atau topik yang tidak ada informasi personal berguna",
-    "sapaan, basa-basi, tawa, acknowledgement, atau penutup percakapan tanpa informasi apapun",
+    "hal random, aktivitas non-kerja, pertanyaan singkat umum, atau topik yang tidak ada informasi personal berguna",
+    (
+        "sapaan, basa-basi, tawa, acknowledgement, atau penutup percakapan; "
+        "juga perintah satu-kali seperti set timer, cari berita, cek waktu, "
+        "ambil foto, atau query informasi tanpa konteks personal"
+    ),
 ]
 
 _CANDIDATE_TO_LABEL = {
-    "nama pengguna, nomor HP, email, alamat, atau data identitas personal"                                                                      : "data_pribadi",
-    "jadwal kerja, meeting rutin, reminder pekerjaan, atau aktivitas profesional sehari-hari — bukan proyek spesifik"                           : "pekerjaan",
-    "proyek software spesifik yang sedang dikerjakan: sprint planning, arsitektur sistem, code review project sendiri"                          : "project",
-    "pertanyaan atau diskusi teknis umum: Docker, JWT, REST API, GraphQL, Node.js — bukan tentang proyek sendiri"                              : "teknis",
-    "preferensi jadwal, kebiasaan kerja, atau cara kerja yang disukai pengguna. Contoh: prefer meeting pagi, standup rutin"                    : "preferensi",
-    "riwayat karir, pengalaman kerja masa lalu, atau portfolio — bukan proyek yang sedang berjalan sekarang"                                   : "pengalaman",
-    "hal random, aktivitas non-kerja, pertanyaan singkat, atau topik yang tidak ada informasi personal berguna"                                : "lainnya",
-    "sapaan, basa-basi, tawa, acknowledgement, atau penutup percakapan tanpa informasi apapun"                                                 : "tidak_penting",
+    "nama pengguna, nomor HP, email, alamat, atau data identitas personal": "data_pribadi",
+    (
+        "jadwal kerja terjadwal, meeting rutin berulang, atau pengingat tugas "
+        "profesional spesifik — BUKAN query informasi umum, BUKAN perintah "
+        "satu-kali seperti cek berita atau set timer"
+    ): "pekerjaan",
+    "proyek software spesifik yang sedang dikerjakan: sprint planning, arsitektur sistem, code review project sendiri": "project",
+    (
+        "pertanyaan atau diskusi teknis umum mendalam: Docker, JWT, REST API, "
+        "GraphQL, Node.js — diskusi panjang, bukan pencarian satu-kali"
+    ): "teknis",
+    (
+        "preferensi jadwal, kebiasaan kerja, atau cara kerja yang disukai "
+        "pengguna yang dinyatakan secara eksplisit — BUKAN perintah one-shot"
+    ): "preferensi",
+    "riwayat karir, pengalaman kerja masa lalu, atau portfolio — bukan proyek yang sedang berjalan sekarang": "pengalaman",
+    "hal random, aktivitas non-kerja, pertanyaan singkat umum, atau topik yang tidak ada informasi personal berguna": "lainnya",
+    (
+        "sapaan, basa-basi, tawa, acknowledgement, atau penutup percakapan; "
+        "juga perintah satu-kali seperti set timer, cari berita, cek waktu, "
+        "ambil foto, atau query informasi tanpa konteks personal"
+    ): "tidak_penting",
 }
 
 _CLASSIFIER_CACHE: dict = {}
@@ -211,17 +308,20 @@ def _get_nli_classifier(model_name: str, device: str):
     return _CLASSIFIER_CACHE[key]
 
 
-def _classify_with_nli(text: str, classifier) -> str:
+def _classify_with_nli(text: str, classifier) -> tuple[str, float]:
+    """Return (label, confidence). confidence = skor probabilitas top label."""
     try:
         result        = classifier(text, candidate_labels=_LABEL_CANDIDATES, multi_label=False)
         top_candidate = result["labels"][0]
-        return _CANDIDATE_TO_LABEL.get(top_candidate, "lainnya")
+        confidence    = float(result["scores"][0])
+        return _CANDIDATE_TO_LABEL.get(top_candidate, "lainnya"), confidence
     except Exception as e:
         _log(f"NLI Classifier error: {e}", level="WARN")
-        return "lainnya"
+        return "lainnya", 0.0
 
 
-def _classify_with_st(text: str, st_model) -> str:
+def _classify_with_st(text: str, st_model) -> tuple[str, float]:
+    """Return (label, confidence). confidence = cosine similarity tertinggi."""
     import numpy as np
 
     model_key = id(st_model)
@@ -232,14 +332,16 @@ def _classify_with_st(text: str, st_model) -> str:
     label_embeddings = _ST_LABEL_CACHE[model_key]
 
     try:
-        text_emb  = st_model.encode([text], convert_to_numpy=True)[0]
-        norms     = np.linalg.norm(label_embeddings, axis=1) * np.linalg.norm(text_emb)
-        scores    = label_embeddings @ text_emb / (norms + 1e-8)
-        top_label = _LABEL_CANDIDATES[int(np.argmax(scores))]
-        return _CANDIDATE_TO_LABEL.get(top_label, "lainnya")
+        text_emb   = st_model.encode([text], convert_to_numpy=True)[0]
+        norms      = np.linalg.norm(label_embeddings, axis=1) * np.linalg.norm(text_emb)
+        scores     = label_embeddings @ text_emb / (norms + 1e-8)
+        top_idx    = int(np.argmax(scores))
+        top_label  = _LABEL_CANDIDATES[top_idx]
+        confidence = float(scores[top_idx])
+        return _CANDIDATE_TO_LABEL.get(top_label, "lainnya"), confidence
     except Exception as e:
         _log(f"ST classifier error: {e}", level="WARN")
-        return "lainnya"
+        return "lainnya", 0.0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -382,6 +484,11 @@ def _make_fingerprint(messages: list[dict]) -> str:
         content = (m.get("content") or "")[:80]
         parts.append(f"{m.get('role','?')}:{content}")
     return "|".join(parts)
+
+
+# Threshold confidence minimum untuk direct save tanpa SLM check.
+# Di bawah nilai ini → redirect ke SLM meskipun label sudah di _DIRECT_SAVE_LABELS.
+_DIRECT_SAVE_MIN_CONFIDENCE = 0.45
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -539,14 +646,20 @@ class FactExtractor:
             self._fire_callback("tidak_penting", False)
             return
 
-        # ── Step [2]: classifier → label ──────────────────────────
+        # ── Step [1.6]: utility command filter (v6.3.0) ───────────
+        if _is_utility_command(messages):
+            _log("Utility command detected → skip save (step 1.6)")
+            self._fire_callback("tidak_penting", False)
+            return
+
+        # ── Step [2]: classifier → label + confidence ─────────────
         classifier = self._get_classifier()
         if self._classifier_model == "st":
-            label = _classify_with_st(conv, classifier)
+            label, confidence = _classify_with_st(conv, classifier)
         else:
-            label = _classify_with_nli(conv, classifier)
+            label, confidence = _classify_with_nli(conv, classifier)
 
-        _log(f"Step[2] label={label}")
+        _log(f"Step[2] label={label} confidence={confidence:.3f}")
 
         importance = _LABEL_IMPORTANCE.get(label, 6)
 
@@ -556,22 +669,26 @@ class FactExtractor:
             self._fire_callback(label, False)
             return
 
-        # Jalur 2: jelas penting → SAVE langsung (tanpa SLM)
+        # Jalur 2: jelas penting + confidence cukup → SAVE langsung (tanpa SLM)
+        # Jika confidence rendah → redirect ke SLM meskipun label direct-save
         if label in _DIRECT_SAVE_LABELS:
-            _log(f"Label '{label}' imp={importance} → direct save (no SLM)")
+            if confidence >= _DIRECT_SAVE_MIN_CONFIDENCE:
+                _log(f"Label '{label}' imp={importance} conf={confidence:.3f} → direct save (no SLM)")
+                summary    = _extract_user_texts(messages)[:150]
+                daily_note = f"[{label}] {summary[:80]}"
+                self._save_daily(daily_note)
+                self._save_episodic(label, summary, messages)
+                elapsed = (time.perf_counter() - t0) * 1000
+                _log(f"Done {elapsed:.0f}ms | label={label} | saved=True (direct)")
+                self._fire_callback(label, True)
+                return
+            else:
+                _log(
+                    f"Label '{label}' conf={confidence:.3f} < {_DIRECT_SAVE_MIN_CONFIDENCE} "
+                    f"→ redirect ke SLM check"
+                )
 
-            # FIX v6.2.4: pakai _extract_user_texts() — tanpa prefix [USER]
-            summary    = _extract_user_texts(messages)[:150]
-            daily_note = f"[{label}] {summary[:80]}"
-
-            self._save_daily(daily_note)
-            self._save_episodic(label, summary, messages)
-            elapsed = (time.perf_counter() - t0) * 1000
-            _log(f"Done {elapsed:.0f}ms | label={label} | saved=True (direct)")
-            self._fire_callback(label, True)
-            return
-
-        # Jalur 3: ambigu → tanya SLM
+        # Jalur 3: ambigu ATAU direct-save confidence rendah → tanya SLM
         _log(f"Label '{label}' → SLM check", level="DEBUG", debug=self._debug)
         raw_response = self._call_slm(conv, label)
         if not raw_response:
@@ -584,10 +701,7 @@ class FactExtractor:
         parsed      = _parse_slm_response(raw_response)
         should_save = parsed["should_save"]
         daily_note  = parsed["daily_note"]
-
-        # FIX v6.2.4: pakai _extract_user_texts() — tanpa prefix [USER]
-        # SLM hanya dipakai untuk should_save dan daily_note, bukan summary
-        summary = _extract_user_texts(messages)[:150]
+        summary     = _extract_user_texts(messages)[:150]
 
         if daily_note:
             self._save_daily(daily_note)
