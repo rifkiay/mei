@@ -1,5 +1,5 @@
 """
-Async Fact Extractor — MEI v6.3.0
+Async Fact Extractor — MEI v6.3.1
 ==================================
 Pipeline 4-step yang dioptimalkan untuk SLM kecil (Qwen 3 1.7B):
 
@@ -12,6 +12,13 @@ Pipeline 4-step yang dioptimalkan untuk SLM kecil (Qwen 3 1.7B):
                                 Label jelas langsung SAVE (jika confidence ≥ 0.45)
                                 Label jelas tidak penting langsung DROP
   [4]   Python routing        — berdasarkan label + should_save → simpan / drop
+
+Perubahan dari v6.3.0 (v6.3.1):
+  - FIX: _process() — classifier sekarang hanya baca input user (_format_user_only),
+    bukan full conversation termasuk response LLM (_format_conversation).
+    Bug: "ada yang lain?" → label 'teknis' karena LLM-nya jawab berita ekonomi.
+    Fix: conv_user = _format_user_only(messages) → classifier tidak "terkontaminasi"
+    oleh isi jawaban LLM yang tidak relevan dengan intent user.
 
 Perubahan dari v6.2.4 (v6.3.0):
   - ADD: _UTILITY_PATTERNS + _is_utility_command() — Step [1.6] baru.
@@ -634,8 +641,13 @@ class FactExtractor:
     def _process(self, messages: list[dict]):
         t0 = time.perf_counter()
 
-        conv = _format_conversation(messages, MAX_CONV_CHARS)
-        if not conv.strip():
+        # v6.3.1: pisah dua teks:
+        #   conv_user  → hanya input user, dipakai untuk classifier & semua filter
+        #   conv_full  → termasuk response LLM, tidak dipakai (dihapus dari pipeline)
+        # Alasan: classifier yang baca response LLM akan salah label —
+        # "ada yang lain?" dapat label 'teknis' karena LLM-nya jawab berita ekonomi.
+        conv_user = _format_user_only(messages, MAX_CONV_CHARS)
+        if not conv_user.strip():
             _log("Empty conversation, skipping", level="DEBUG", debug=self._debug)
             self._fire_callback("", False)
             return
@@ -653,11 +665,12 @@ class FactExtractor:
             return
 
         # ── Step [2]: classifier → label + confidence ─────────────
+        # Classifier hanya lihat input user — bukan response LLM
         classifier = self._get_classifier()
         if self._classifier_model == "st":
-            label, confidence = _classify_with_st(conv, classifier)
+            label, confidence = _classify_with_st(conv_user, classifier)
         else:
-            label, confidence = _classify_with_nli(conv, classifier)
+            label, confidence = _classify_with_nli(conv_user, classifier)
 
         _log(f"Step[2] label={label} confidence={confidence:.3f}")
 
@@ -689,8 +702,10 @@ class FactExtractor:
                 )
 
         # Jalur 3: ambigu ATAU direct-save confidence rendah → tanya SLM
+        # SLM butuh full context (user + assistant) untuk generate daily note akurat
         _log(f"Label '{label}' → SLM check", level="DEBUG", debug=self._debug)
-        raw_response = self._call_slm(conv, label)
+        conv_full    = _format_conversation(messages, MAX_CONV_CHARS)
+        raw_response = self._call_slm(conv_full, label)
         if not raw_response:
             _log("SLM returned empty response", level="WARN")
             self._fire_callback(label, False)
