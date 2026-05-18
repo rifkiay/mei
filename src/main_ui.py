@@ -1,7 +1,25 @@
 """
 MEI — AI Personal Assistant
 =============================
-Version 4.5.15
+Version 4.5.17
+
+Perubahan v4.5.17:
+  - FIX: Tool history contamination (revert strategi hapus-total v4.5.10).
+    function result kembali disimpan ke history tapi di-compress + assistant
+    response di-truncate 70 char → LLM tidak amnesia antar tool turn.
+    Cross-tool contamination (search → camera) tidak terjadi lagi karena
+    function result sudah di-compress menjadi summary pendek.
+  - FIX: STT mode 5 — _is_safe_to_record() bypass audio_lock saat voice_out=False.
+    Mode 5 tidak ada TTS sehingga lock tidak pernah held, tidak perlu cooldown.
+  - ADD: _TOOL_HINT injection ke build_system_message() — LLM dapat hint
+    konteks tool turn sebelumnya ("Informasi terkini sudah dicari...").
+
+Perubahan v4.5.16:
+  - ADD: Mode 5 (STT → Text) — voice input, text output tanpa TTS.
+    Berguna saat pengguna ingin bicara tapi tidak ingin output audio
+    (misal: pakai earphone, lingkungan tenang, atau TTS belum ready).
+    voice_in=True, voice_out=False, use_rvc=False.
+    Aktifkan dengan: mode 5 / mode stt-text / mode st / voice text
 
 Perubahan v4.5.15:
   - FIX: Bug 'ancur' (asisten meniru placeholder [Selesai]). 
@@ -114,6 +132,7 @@ I/O Modes:
   2. Text → TTS         (ketik, dengarkan)
   3. STT  → TTS         (full voice loop)
   4. STT  → TTS + RVC   (full pipeline, voice conversion)
+  5. STT  → Text        (voice input, text output — no TTS)
 """
 
 import os
@@ -260,36 +279,49 @@ _STOP_SENTINEL = object()
 # GT DATASET — 27 input test case
 # turn_no: 1, 3, 5, ... (genap = respons LLM)
 # ══════════════════════════════════════════════════════════════════
-
-GT_DATASET: list[tuple[int, str, str, int, Optional[str]]] = [
-    # (turn_no, input_text, label, importance, tool_gt)
-    ( 1, "Hai, nama saya rifki, saya seorang backend developer.",                 "data_pribadi",  9, None),
-    ( 3, "Senang banget punya asisten AI yang bisa diajak ngobrol gini.",                   "tidak_penting", 1, None),
-    ( 5, "Oh ya, tolong cek jadwal kerja saya hari ini dong.",                              "pekerjaan",     8, "get_events"),
-    ( 7, "Foto CV saya ini ya, biar kamu tahu background pengalaman saya.",                 "pengalaman",    6, "camera_capture"),
-    ( 9, "Tolong buatin event 'Sprint Planning' untuk besok jam 9 pagi.",                   "project",       8, "create_event"),
-    (11, "Cari info tentang Kong API Gateway dong, buat referensi project saya.",           "teknis",        7, "internet_search"),
-    (13, "Cek jadwal saya minggu ini, saya biasanya prefer meeting pagi.",                  "preferensi",    7, "get_events"),
-    (15, "Haha seru juga, set timer 5 menit dulu ah buat jeda sebentar.",                   "tidak_penting", 1, "set_timer"),
-    (17, "Ngomong-ngomong, apa ya perbedaan REST API dan GraphQL?",                         "teknis",        7, "internet_search"),
-    (19, "Nomor HP saya 0812-3456-7890, kalau perlu dihubungi.",                            "data_pribadi",  9, None),
-    (21, "Saya sudah 4 tahun pengalaman di web development, fokusnya di backend.",          "pengalaman",    6, None),
-    (23, "Tolong foto diagram arsitektur project yang ada di papan tulis ini.",             "project",       8, "camera_capture"),
-    (25, "Set timer 25 menit buat sesi Pomodoro coding sekarang.",                          "lainnya",       5, "set_timer"),
-    (27, "Cari tutorial cara setup Docker di Ubuntu 22.04 dong.",                           "teknis",        7, "internet_search"),
-    (29, "Buatin jadwal meeting dengan klien, Kamis jam 2 siang.",                          "pekerjaan",     8, "create_event"),
-    (31, "Ada event apa saja yang terjadwal minggu ini?",                                   "pekerjaan",     8, "get_events"),
-    (33, "Bikin event standup harian rutin tiap Senin sampai Jumat jam 8 pagi.",            "preferensi",    7, "create_event"),
-    (35, "Set timer 30 menit buat sesi review kode project API ini.",                       "project",       8, "set_timer"),
-    (37, "Oke, ngerti sekarang. Makasih ya infonya.",                                       "tidak_penting", 1, None),
-    (39, "Oh ya, email kantor saya rifki@devstudio.id.",                                     "data_pribadi",  9, None),
-    (41, "Foto pesan error di terminal ini, tolong bantu analisis masalahnya.",             "lainnya",       5, "camera_capture"),
-    (43, "Bikin reminder 'Demo ke Klien' untuk Jumat jam 3 sore.",                          "pekerjaan",     8, "create_event"),
-    (45, "Set timer 10 menit buat istirahat sebentar dulu.",                                "lainnya",       5, "set_timer"),
-    (47, "Cari cara implementasi JWT authentication di Node.js.",                           "teknis",        7, "internet_search"),
-    (49, "Foto halaman portfolio project lama saya ini buat referensi.",                    "pengalaman",    6, "camera_capture"),
-    (51, "Cek jadwal besok pagi, saya prefer mulai aktivitas dari jam 8.",                  "preferensi",    7, "get_events"),
-    (53, "Sip, segitu dulu untuk sekarang. Nanti lanjut lagi.",                             "tidak_penting", 1, None),
+# turn_no ganjil = user turn, sesuai format mei_turns.jsonl
+# ─────────────────────────────────────────────────────────────────────────────
+GT_DATASET = [
+    ( 1, "Hai, nama saya Rifki Ainul, saya seorang backend developer.",             "data_pribadi",  9,  None),
+    ( 3, "Senang banget punya asisten AI yang bisa diajak ngobrol gini.",           "tidak_penting", 1,  None),
+    ( 5, "Btw kamu tahu kan nama gue siapa?",                                       "tidak_penting", 1,  None),
+    # ↑ MULTI-TURN TEST: T5 trigger nama, T1 masih dalam window GPU & CPU → kedua mode harus 1.0
+    ( 7, "Oh ya, tolong cek jadwal kerja saya hari ini dong.",                      "pekerjaan",     8,  "get_events"),
+    ( 9, "Foto CV saya ini ya, biar kamu tahu background pengalaman saya.",         "pengalaman",    6,  "camera_capture"),
+    (11, "Tolong buatin event 'Sprint Planning' untuk besok jam 9 pagi.",           "project",       8,  "create_event"),
+    (13, "Eh btw event Sprint Planning tadi berhasil ke-create kan?",               "project",       7,  None),
+    # ↑ MULTI-TURN TEST: T13 merujuk T11, dalam window GPU & CPU
+    (15, "Cari info tentang Kong API Gateway dong, buat referensi project saya.",   "teknis",        7,  "internet_search"),
+    (17, "Hasilnya gimana? Ada yang relevan buat architecture project saya?",       "teknis",        7,  None),
+    # ↑ MULTI-TURN TEST: T17 follow-up dari T15
+    (19, "Cek jadwal saya minggu ini, saya biasanya prefer meeting pagi.",          "preferensi",    7,  "get_events"),
+    (21, "Haha seru juga, set timer 5 menit dulu ah buat jeda sebentar.",           "tidak_penting", 1,  "set_timer"),
+    # ↑ T21: topik baru → Context Retention 1.0 otomatis
+    (23, "Ngomong-ngomong, apa ya perbedaan REST API dan GraphQL?",                 "teknis",        7,  "internet_search"),
+    (25, "Oke ngerti. Nah terus mana yang lebih cocok buat project API saya?",     "teknis",        8,  None),
+    # ↑ MULTI-TURN TEST: T25 merujuk T23
+    (27, "Nomor HP saya 0812-1234-0000, kalau perlu dihubungi.",                    "data_pribadi",  9,  None),
+    (29, "Saya sudah 4 tahun pengalaman di web development, fokusnya di backend.",  "pengalaman",    6,  None),
+    (31, "Tolong foto diagram arsitektur project yang ada di papan tulis ini.",     "project",       8,  "camera_capture"),
+    (33, "Set timer 25 menit buat sesi Pomodoro coding sekarang.",                  "lainnya",       5,  "set_timer"),
+    (35, "Cari tutorial cara setup Docker di Ubuntu 22.04 dong.",                   "teknis",        7,  "internet_search"),
+    (37, "Oke, gue mau langsung praktek. Buatin meeting sama tim buat review, Kamis jam 2.", "pekerjaan", 8, "create_event"),
+    # ↑ T37: switch topik → Context Retention 1.0 otomatis
+    (39, "Ada event apa saja yang terjadwal minggu ini?",                           "pekerjaan",     8,  "get_events"),
+    (41, "Bikin event standup harian rutin tiap Senin sampai Jumat jam 8 pagi.",    "preferensi",    7,  "create_event"),
+    (43, "Set timer 30 menit buat sesi review kode project API ini.",               "project",       8,  "set_timer"),
+    (45, "Oke, ngerti sekarang. Makasih ya infonya.",                               "tidak_penting", 1,  None),
+    # ↑ T45: basa-basi → Context Retention 1.0 otomatis
+    (47, "Oh ya, email kantor saya rifki@devstudio.id.",                             "data_pribadi",  9,  None),
+    (49, "Foto pesan error di terminal ini, tolong bantu analisis masalahnya.",     "lainnya",       5,  "camera_capture"),
+    (51, "Bikin reminder 'Demo ke Klien' untuk Jumat jam 3 sore.",                   "pekerjaan",     8,  "create_event"),
+    (53, "Cari cara implementasi JWT authentication di Node.js.",                    "teknis",        7,  "internet_search"),
+    (55, "Foto halaman portfolio project lama saya ini buat referensi.",            "pengalaman",    6,  "camera_capture"),
+    (57, "Cek jadwal besok pagi, saya prefer mulai aktivitas dari jam 8.",          "preferensi",    7,  "get_events"),
+    (59, "Btw gue prefer meeting pagi, kamu tahu kan dari obrolan tadi?",           "preferensi",    7,  None),
+    # ↑ MULTI-TURN TEST: T59 merujuk T19/T57
+    (61, "Sip, segitu dulu untuk sekarang. Nanti lanjut lagi.",                     "tidak_penting", 1,  None),
+    # ↑ T61: basa-basi penutup → semua dimensi 1.0 otomatis
 ]
 
 # ── v4.5.5: GT lookup dict (turn_no → metadata) ─────────────────
@@ -459,25 +491,35 @@ class IOMode(IntEnum):
     TEXT_TTS    = 2
     STT_TTS     = 3
     STT_TTS_RVC = 4
+    STT_TEXT    = 5   # ← v4.5.16: voice input, text output (no TTS)
 
 IO_MODE_LABELS = {
     IOMode.TEXT_TEXT:   "Text → Text    (default)",
     IOMode.TEXT_TTS:    "Text → TTS",
     IOMode.STT_TTS:     "STT  → TTS",
     IOMode.STT_TTS_RVC: "STT  → TTS + RVC",
+    IOMode.STT_TEXT:    "STT  → Text    (voice in, no TTS)",  # ← v4.5.16
 }
 
 @dataclass
 class IOState:
     mode   : IOMode = IOMode.TEXT_TEXT
     use_gpu: bool   = True
+    rvc_on : bool   = False   # v4.5.18: RVC flag independen dari mode
 
     @property
-    def voice_in(self)  -> bool: return self.mode in (IOMode.STT_TTS, IOMode.STT_TTS_RVC)
+    def voice_in(self)  -> bool:
+        return self.mode in (IOMode.STT_TTS, IOMode.STT_TTS_RVC, IOMode.STT_TEXT)
+
     @property
-    def voice_out(self) -> bool: return self.mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
+    def voice_out(self) -> bool:
+        return self.mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
+
     @property
-    def use_rvc(self)   -> bool: return self.mode == IOMode.STT_TTS_RVC
+    def use_rvc(self) -> bool:
+        # v4.5.18: RVC aktif kalau flag rvc_on=True ATAU mode legacy STT_TTS_RVC
+        return self.rvc_on or self.mode == IOMode.STT_TTS_RVC
+
     @property
     def device(self)    -> str:  return "cuda" if self.use_gpu else "cpu"
 
@@ -683,6 +725,20 @@ def _get_max_history(use_gpu: bool) -> int:
 # BUILD SYSTEM MESSAGE
 # ══════════════════════════════════════════════════════════════════
 
+_TOOL_HINT = {
+    "internet_search" : "Informasi terkini sudah dicari di turn sebelumnya.",
+    "camera_capture"  : "Gambar sudah diambil dan dianalisa di turn sebelumnya.",
+    "get_events"      : "Jadwal/kalender sudah dicek di turn sebelumnya.",
+    "create_event"    : "Event sudah dibuat di turn sebelumnya.",
+    "delete_event"    : "Event sudah dihapus di turn sebelumnya.",
+    "set_timer"       : "Timer sudah di-set di turn sebelumnya.",
+    "list_timers"     : "Daftar timer sudah ditampilkan di turn sebelumnya.",
+    "cancel_timer"    : "Timer sudah dibatalkan di turn sebelumnya.",
+    "schedule_notification": "Notifikasi sudah dijadwalkan di turn sebelumnya.",
+    "cancel_notification"  : "Notifikasi sudah dibatalkan di turn sebelumnya.",
+}
+
+
 def build_system_message(
     profile_agent : str,
     memory_md     : str,
@@ -721,7 +777,10 @@ def build_system_message(
             )
 
     if last_tool_used:
-        _dbg(f"build_system_message: last_tool_used={last_tool_used} (tidak diinjek ke prompt)")
+        hint = _TOOL_HINT.get(last_tool_used)
+        if hint:
+            msg += f"\n\n[KONTEKS TOOL] {hint}"
+        _dbg(f"build_system_message: last_tool_used={last_tool_used} hint='{hint}'")
 
     msg += f"\n{sep}"
     return msg
@@ -1201,13 +1260,15 @@ def _stream_and_speak(
     Stream respons dari LLM, kirim delta ke:
       - terminal (print)
       - on_token(delta) jika tersedia → UI
-      - TTS jika voice_out aktif
+      - TTS jika voice_out aktif (mode 1-4, BUKAN mode 5)
     """
     full_response  = ""
     all_messages  : list[dict] = []
     text_buffer    = ""
+    # voice_out=False untuk mode 5 → speak_mode otomatis False → TTS skip
     speak_mode     = io_state.voice_out and vs.voice_ok and vs.tts
     _prev_resp_len = 0  # v4.5.9-fix: deteksi tool execution dalam satu turn
+    _last_msg_role = None  # v4.5.18: track role sebelumnya untuk reset full_response
 
     print("MEI: ", end="", flush=True)
 
@@ -1266,7 +1327,18 @@ def _stream_and_speak(
 
             last = responses[-1]
             if last.get("role") not in ("assistant", None):
+                _last_msg_role = last.get("role")
                 continue
+
+            # v4.5.18: reset full_response saat transisi dari function → assistant
+            # Ini fix kasus tool selesai tapi responses hanya loncat 1 (tidak trigger reset lama)
+            if _last_msg_role == "function":
+                if full_response:
+                    print()
+                    print("MEI: ", end="", flush=True)
+                full_response = ""
+                _dbg("Transisi function→assistant: reset full_response")
+            _last_msg_role = last.get("role")
 
             text = _extract_text_content(last.get("content"))
             if not text or len(text) <= len(full_response):
@@ -1288,6 +1360,7 @@ def _stream_and_speak(
                 except Exception as e:
                     _dbg(f"on_token error: {e}")
 
+            # speak_mode=False untuk mode 5 → blok ini skip otomatis
             if not speak_mode:
                 continue
 
@@ -1323,7 +1396,7 @@ def _stream_and_speak(
 def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
     s = lt_mem.stats()
     print("\n" + "=" * 60)
-    print("MEI — Personal Assistant v4.5.15")
+    print("MEI — Personal Assistant v4.5.16")
     print("=" * 60)
     print(f"  User        : {USER_ID}")
     print(f"  Short-term  : JSONL window {MEMORY_CONFIG['window_size']} turn")
@@ -1353,7 +1426,8 @@ def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
     print("  proactive                — status proactive engine")
     print("  calendar                 — events hari ini + cek notif sekarang")
     print("  mode                     — tampilkan mode aktif")
-    print("  mode 1/2/3/4             — ganti I/O mode")
+    print("  mode 1/2/3/4/5           — ganti I/O mode")
+    print("    1: Text→Text  2: Text→TTS  3: STT→TTS  4: STT→TTS+RVC  5: STT→Text")
     print("  gpu / cpu                — ganti hardware target")
     print("  debug on/off             — toggle debug tool logging")
     print("  test                     — jalankan 27 GT input otomatis (semua)")
@@ -1365,20 +1439,26 @@ def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
 
 def _parse_mode_cmd(cmd: str) -> Optional[IOMode]:
     table = {
-        "mode 1"    : IOMode.TEXT_TEXT,
-        "mode text" : IOMode.TEXT_TEXT,
-        "mode tt"   : IOMode.TEXT_TEXT,
-        "mode 2"    : IOMode.TEXT_TTS,
-        "mode tts"  : IOMode.TEXT_TTS,
-        "mode 3"    : IOMode.STT_TTS,
-        "mode stt"  : IOMode.STT_TTS,
-        "mode voice": IOMode.STT_TTS,
-        "mode 4"    : IOMode.STT_TTS_RVC,
-        "mode rvc"  : IOMode.STT_TTS_RVC,
-        "mode full" : IOMode.STT_TTS_RVC,
-        "voice"     : IOMode.STT_TTS,
-        "voice tts" : IOMode.STT_TTS,
-        "voice rvc" : IOMode.STT_TTS_RVC,
+        "mode 1"       : IOMode.TEXT_TEXT,
+        "mode text"    : IOMode.TEXT_TEXT,
+        "mode tt"      : IOMode.TEXT_TEXT,
+        "mode 2"       : IOMode.TEXT_TTS,
+        "mode tts"     : IOMode.TEXT_TTS,
+        "mode 3"       : IOMode.STT_TTS,
+        "mode stt"     : IOMode.STT_TTS,
+        "mode voice"   : IOMode.STT_TTS,
+        "mode 4"       : IOMode.STT_TTS_RVC,
+        "mode rvc"     : IOMode.STT_TTS_RVC,
+        "mode full"    : IOMode.STT_TTS_RVC,
+        # ── v4.5.16: Mode 5 — STT → Text ──────────────────────────
+        "mode 5"       : IOMode.STT_TEXT,
+        "mode stt-text": IOMode.STT_TEXT,
+        "mode st"      : IOMode.STT_TEXT,
+        "voice text"   : IOMode.STT_TEXT,
+        # ──────────────────────────────────────────────────────────
+        "voice"        : IOMode.STT_TTS,
+        "voice tts"    : IOMode.STT_TTS,
+        "voice rvc"    : IOMode.STT_TTS_RVC,
     }
     return table.get(cmd)
 
@@ -1620,6 +1700,8 @@ def _process_turn(
 
         if io_state.voice_in and io_state.voice_out:
             _mode_lbl = "STT -> TTS"
+        elif io_state.voice_in and not io_state.voice_out:
+            _mode_lbl = "STT -> Text"   # ← v4.5.16: label mode 5
         elif io_state.voice_out:
             _mode_lbl = "Text -> TTS"
         else:
@@ -1646,32 +1728,42 @@ def _process_turn(
 
         _dbg(f"last_used_realtime_tool next turn = {shared['last_used_realtime_tool']}")
 
-        _was_realtime_turn = tool_info.get("tool_used") in REALTIME_TOOLS
+        # ── v4.5.17: history update ──────────────────────────────────
+        # function result SELALU disimpan (di-compress oleh _compress_function_result)
+        # assistant response di-truncate agresif untuk realtime turn
+        # Tidak ada penghapusan total → LLM tidak amnesia antar tool turn
+        _REALTIME_ASSISTANT_TRUNCATE = 70
+        _CPU_ASSISTANT_TRUNCATE      = 80
+
+        _was_realtime_turn  = tool_info.get("tool_used") in REALTIME_TOOLS
         new_history_entries = []
 
         for _m in all_messages:
             if _m.get("role") == "user":
                 continue
-            
+
             _entry = dict(_m)
-            
+
             if _entry.get("role") == "function":
+                # Compress function result — untuk internet_search dan camera_capture
+                # hasilnya menjadi summary pendek sehingga LLM tahu "turn ini sudah
+                # search/foto" tapi tidak membaca full content yang bisa mengkontaminasi
                 _entry = _compress_function_result(_entry)
-                
+
             elif _entry.get("role") == "assistant":
                 text = _extract_text_content(_entry.get("content", ""))
-                # Jika ini final response (tanpa function_call/tool_calls)
+                # Hanya truncate final response (bukan assistant msg yang punya function_call)
                 if text and not _entry.get("function_call") and not _entry.get("tool_calls"):
                     if _was_realtime_turn:
-                        # Truncate sangat pendek untuk mencegah stale response
-                        # tapi tetap menyisakan awal kalimat agar LLM tahu turn sudah selesai.
-                        _entry["content"] = text[:70] + ("..." if len(text) > 70 else "")
+                        # Truncate pendek: LLM tahu turn selesai, tidak terkontaminasi
+                        _entry["content"] = text[:_REALTIME_ASSISTANT_TRUNCATE] + (
+                            "..." if len(text) > _REALTIME_ASSISTANT_TRUNCATE else ""
+                        )
                     elif not io_state.use_gpu:
-                        # Truncate untuk hemat token di CPU
-                        _entry["content"] = text[:80] + "..."
+                        _entry["content"] = text[:_CPU_ASSISTANT_TRUNCATE] + "..."
                     else:
                         _entry["content"] = text
-                        
+
             new_history_entries.append(_entry)
 
         conv_history.append({"role": "user", "content": user_input})
@@ -1868,6 +1960,9 @@ def _make_ui_stt_and_callback(
         def _is_safe_to_record() -> bool:
             if app._busy:
                 return False
+            # Mode 5 (STT_TEXT): tidak ada TTS → skip semua audio lock check
+            if not io_state.voice_out:
+                return True
             if audio_lock.locked():
                 _tts_last_done[0] = time.perf_counter() * 1000.0
                 return False
@@ -1896,10 +1991,13 @@ def _make_ui_stt_and_callback(
                         continue
                     if _stt_ui_stop_event.is_set() or app._busy:
                         continue
-                    if audio_lock.locked():
+                    # ── v4.5.16: mode 5 tidak punya audio_lock concern
+                    # (voice_out=False, tidak ada TTS yang berjalan)
+                    if io_state.voice_out and audio_lock.locked():
                         _tts_last_done[0] = time.perf_counter() * 1000.0
-                        _dbg("STT result dibuang: TTS mulai lagi saat rekam")
+                        _dbg("STT result dibuang: TTS aktif saat rekam selesai")
                         continue
+                    # Mode 5 (STT_TEXT): voice_out=False, tidak ada TTS → lanjut langsung
                     _stt_turn_start[0]    = result.get("t_silence_start_ms", 0.0)
                     _stt_last_asr_done[0] = result.get("t_asr_done_ms", 0.0)
                     if _stt_turn_start[0] > 0.0 and _stt_last_asr_done[0] > 0.0:
@@ -1970,7 +2068,7 @@ def _make_ui_stt_and_callback(
 
         Parameter:
             user_text : teks dari user
-            mode      : "1"/"2"/"3"/"4" — I/O mode string
+            mode      : "1"/"2"/"3"/"4"/"5" — I/O mode string
             on_token  : callback (delta: str) → None, dipanggil per token streaming.
                         Jika None, tidak ada streaming ke UI (kompatibel v4.5.7).
 
@@ -1978,12 +2076,16 @@ def _make_ui_stt_and_callback(
             str : full response (setelah streaming selesai)
         """
         mode_map = {
-            "1": IOMode.TEXT_TEXT,
-            "2": IOMode.TEXT_TTS,
-            "3": IOMode.STT_TTS,
-            "4": IOMode.STT_TTS_RVC,
+            "1" : IOMode.TEXT_TEXT,
+            "2" : IOMode.TEXT_TTS,
+            "2r": IOMode.TEXT_TTS,     # TTS + RVC (rvc di-set via flag terpisah)
+            "3" : IOMode.STT_TTS,
+            "3r": IOMode.STT_TTS,      # STT + TTS + RVC
+            "4" : IOMode.STT_TTS_RVC,  # legacy
+            "5" : IOMode.STT_TEXT,
         }
-        io_state.mode = mode_map.get(mode, IOMode.TEXT_TEXT)
+        io_state.mode    = mode_map.get(mode, IOMode.TEXT_TEXT)
+        io_state.rvc_on  = mode.endswith("r")   # flag RVC terpisah dari mode
 
         print(f"\n[UI] {USER_ID}: {user_text}", flush=True)
         cmd = user_text.lower().strip()
@@ -1999,10 +2101,14 @@ def _make_ui_stt_and_callback(
 
         new_mode = _parse_mode_cmd(cmd)
         if new_mode is not None:
-            needs_voice = new_mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
-            needs_rvc   = new_mode == IOMode.STT_TTS_RVC
-            if needs_voice and not vs.voice_ok:
-                return "Voice tidak tersedia. Mode tidak diubah."
+            # ── v4.5.16: pisah cek STT dan TTS ───────────────────
+            needs_stt = new_mode in (IOMode.STT_TTS, IOMode.STT_TTS_RVC, IOMode.STT_TEXT)
+            needs_tts = new_mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
+            needs_rvc = new_mode == IOMode.STT_TTS_RVC
+            if needs_stt and not (vs.stt and vs.voice_ok):
+                return "STT tidak tersedia. Mode tidak diubah."
+            if needs_tts and not vs.voice_ok:
+                return "TTS tidak tersedia. Mode tidak diubah."
             if needs_rvc and not vs.rvc_ok:
                 return "RVC tidak tersedia. Mode tidak diubah."
             io_state.mode = new_mode
@@ -2555,6 +2661,7 @@ def run_agent():
                     _turn_tracker = LatencyTracker()
                     _turn_tracker.mark_turn_start()
                 elif io_state.voice_in and vs.voice_ok and vs.stt:
+                    # ── v4.5.16: mode 5 (STT→Text) masuk cabang ini ──
                     print("\nVoice mode — Enter untuk rekam / ketik langsung")
                     typed = input().strip()
                     if typed:
@@ -2671,7 +2778,7 @@ def run_agent():
                 # ── MODE ──────────────────────────────────────────
                 if cmd == "mode":
                     print(f"\nI/O mode aktif: {io_state.describe()}")
-                    print("Ganti dengan: mode 1 / mode 2 / mode 3 / mode 4\n")
+                    print("Ganti dengan: mode 1 / mode 2 / mode 3 / mode 4 / mode 5\n")
                     continue
 
                 # ── DEBUG ─────────────────────────────────────────
@@ -2692,10 +2799,15 @@ def run_agent():
                 # ── MODE SWITCH ───────────────────────────────────
                 new_mode = _parse_mode_cmd(cmd)
                 if new_mode is not None:
-                    needs_voice = new_mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
-                    needs_rvc   = new_mode == IOMode.STT_TTS_RVC
-                    if needs_voice and not vs.voice_ok:
-                        print("  Voice tidak tersedia. Mode tidak diubah.\n")
+                    # ── v4.5.16: pisah validasi STT vs TTS ───────
+                    needs_stt = new_mode in (IOMode.STT_TTS, IOMode.STT_TTS_RVC, IOMode.STT_TEXT)
+                    needs_tts = new_mode in (IOMode.TEXT_TTS, IOMode.STT_TTS, IOMode.STT_TTS_RVC)
+                    needs_rvc = new_mode == IOMode.STT_TTS_RVC
+                    if needs_stt and not (vs.stt and vs.voice_ok):
+                        print("  STT tidak tersedia. Mode tidak diubah.\n")
+                        continue
+                    if needs_tts and not vs.voice_ok:
+                        print("  TTS tidak tersedia. Mode tidak diubah.\n")
                         continue
                     if needs_rvc and not vs.rvc_ok:
                         print("  RVC tidak tersedia. Mode tidak diubah.\n")
