@@ -1,7 +1,7 @@
 """
 MEI Desktop UI
 ==============
-Version 4.5.8  (+ UI streaming support)
+Version 4.5.18
 
 File terpisah — jalankan bersamaan dengan main.py via:
     python mei_ui.py
@@ -14,11 +14,15 @@ Atau integrasikan ke main.py dengan:
 Fitur:
   - Chat bubble (user kanan, MEI kiri)
   - Notif bar maks 3 notifikasi di atas chat
-  - Mode bar: Text / TTS / STT / STT+RVC
+  - Mode bar: 2 tab (Text | TTS+RVC) + MIC toggle + RVC toggle
+      Text    : mic off → mode 1, mic on → mode 5 (STT→Text)
+      TTS+RVC : mic off → mode 2, mic on → mode 3, mic on + RVC → mode 4
   - Toggle mic — kalau aktif langsung dengerin tanpa tekan Enter
   - Send button → berubah jadi STOP (interrupt) saat MEI sedang balas
   - STT mic: kalau aktif, auto-kirim hasil transkripsi ke agent
-  - [v4.5.8] Streaming token: bubble MEI update real-time per delta
+  - [v4.5.8]  Streaming token: bubble MEI update real-time per delta
+  - [v4.5.17] Tab STT-T (mode 5): voice input, output teks tanpa TTS
+  - [v4.5.18] Redesign ModeBar: 2 tab + MIC toggle + RVC toggle
 """
 
 import tkinter as tk
@@ -184,30 +188,49 @@ class NotifBar(tk.Frame):
 # ══════════════════════════════════════════════════════════════════
 
 class ModeBar(tk.Frame):
-    MODES = [
-        ("Text",    "1"),
-        ("TTS",     "2"),
-        ("STT",     "3"),
-        ("STT+RVC", "4"),
+    """
+    v4.5.18 — 2 tab: Text | TTS+RVC
+    ─────────────────────────────────
+    Tab "Text":
+      mic off → mode 1 (Text)
+      mic on  → mode 5 (STT→Text)
+
+    Tab "TTS+RVC":
+      mic off, rvc off → mode 2 (TTS)
+      mic on,  rvc off → mode 3 (STT+TTS)
+      mic on,  rvc on  → mode 4 (STT+TTS+RVC)
+      mic off, rvc on  → mode 2 (TTS, RVC diabaikan tanpa mic)
+
+    RVC toggle hanya visible di tab TTS+RVC.
+    """
+
+    TABS = [
+        ("Text",    "text"),
+        ("TTS+RVC", "tts"),
     ]
 
     def __init__(self, parent, on_mode_change: Callable, on_mic_toggle: Callable, **kwargs):
         super().__init__(parent, bg=COLORS["bg_panel"], **kwargs)
         self._on_mode_change = on_mode_change
         self._on_mic_toggle  = on_mic_toggle
-        self._current_mode   = "1"
+        self._current_tab    = "text"   # "text" | "tts"
         self._mic_active     = False
-        self._btns: dict[str, tk.Label] = {}
+        self._rvc_active     = False
+        self._tab_btns: dict[str, tk.Label] = {}
         self._build()
 
+    # ── Build ──────────────────────────────────────────────────────
+
     def _build(self):
+        # Label MODE:
         tk.Label(
             self, text="MODE:",
             bg=COLORS["bg_panel"], fg=COLORS["text_dim"],
             font=FONTS["mode"],
         ).pack(side="left", padx=(12, 6))
 
-        for label, code in self.MODES:
+        # 2 tab
+        for label, key in self.TABS:
             btn = tk.Label(
                 self, text=label,
                 bg=COLORS["bg_panel"],
@@ -215,54 +238,81 @@ class ModeBar(tk.Frame):
                 font=FONTS["mode"],
                 padx=10, pady=4,
                 cursor="hand2",
-                relief="flat",
             )
             btn.pack(side="left", padx=2)
-            btn.bind("<Button-1>", lambda e, c=code: self._select_mode(c))
-            btn.bind("<Enter>", lambda e, b=btn: b.config(fg=COLORS["text"]))
-            btn.bind("<Leave>", lambda e, b=btn, c=code: b.config(
-                fg=COLORS["accent"] if c == self._current_mode else COLORS["text_dim"]
+            btn.bind("<Button-1>", lambda e, k=key: self._select_tab(k))
+            btn.bind("<Enter>",    lambda e, b=btn: b.config(fg=COLORS["text"]))
+            btn.bind("<Leave>",    lambda e, b=btn, k=key: b.config(
+                fg=COLORS["accent"] if k == self._current_tab else COLORS["text_dim"]
             ))
-            self._btns[code] = btn
+            self._tab_btns[key] = btn
 
-        self._update_mode_colors()
-
+        # Separator
         tk.Label(
             self, text="│",
             bg=COLORS["bg_panel"], fg=COLORS["border"],
             font=FONTS["mode"],
         ).pack(side="left", padx=8)
 
+        # MIC toggle
         self._mic_label = tk.Label(
             self, text="🎙 MIC: OFF",
-            bg=COLORS["bg_panel"],
-            fg=COLORS["mic_off"],
+            bg=COLORS["bg_panel"], fg=COLORS["mic_off"],
             font=FONTS["mode"],
-            padx=10, pady=4,
-            cursor="hand2",
+            padx=10, pady=4, cursor="hand2",
         )
         self._mic_label.pack(side="left", padx=2)
         self._mic_label.bind("<Button-1>", lambda e: self._toggle_mic())
 
+        # RVC toggle — hanya visible di tab TTS+RVC
+        self._rvc_label = tk.Label(
+            self, text="RVC: OFF",
+            bg=COLORS["bg_panel"], fg=COLORS["text_dim"],
+            font=FONTS["mode"],
+            padx=10, pady=4, cursor="hand2",
+        )
+        self._rvc_label.bind("<Button-1>", lambda e: self._toggle_rvc())
+        # Mulai hidden (tab Text aktif di awal)
+        # pack/unpack dihandle oleh _update_rvc_visibility()
+
+        # Status
         self._status = tk.Label(
             self, text="",
-            bg=COLORS["bg_panel"],
-            fg=COLORS["text_dim"],
+            bg=COLORS["bg_panel"], fg=COLORS["text_dim"],
             font=FONTS["mode"],
         )
         self._status.pack(side="right", padx=12)
 
-    def _select_mode(self, code: str):
-        self._current_mode = code
-        self._update_mode_colors()
-        self._on_mode_change(code)
+        self._update_tab_colors()
+        self._update_rvc_visibility()
 
-    def _update_mode_colors(self):
-        for code, btn in self._btns.items():
-            if code == self._current_mode:
+    # ── Tab select ─────────────────────────────────────────────────
+
+    def _select_tab(self, key: str):
+        self._current_tab = key
+        self._update_tab_colors()
+        self._update_rvc_visibility()
+        # Kalau pindah ke Text dan RVC aktif, matikan RVC
+        if key == "text" and self._rvc_active:
+            self._rvc_active = False
+            self._rvc_label.config(text="RVC: OFF", fg=COLORS["text_dim"])
+        self._emit_mode()
+
+    def _update_tab_colors(self):
+        for key, btn in self._tab_btns.items():
+            if key == self._current_tab:
                 btn.config(fg=COLORS["accent"], font=(*FONTS["mode"][:2], "bold"))
             else:
                 btn.config(fg=COLORS["text_dim"], font=FONTS["mode"])
+
+    def _update_rvc_visibility(self):
+        if self._current_tab == "tts":
+            self._rvc_label.pack(side="left", padx=2)
+            self._update_rvc_clickable()
+        else:
+            self._rvc_label.pack_forget()
+
+    # ── Mic toggle ─────────────────────────────────────────────────
 
     def _toggle_mic(self):
         self._mic_active = not self._mic_active
@@ -270,18 +320,63 @@ class ModeBar(tk.Frame):
             self._mic_label.config(text="🎙 MIC: ON", fg=COLORS["mic_on"])
         else:
             self._mic_label.config(text="🎙 MIC: OFF", fg=COLORS["mic_off"])
+        self._update_rvc_clickable()
         self._on_mic_toggle(self._mic_active)
+        self._emit_mode()
+
+    # ── RVC toggle ─────────────────────────────────────────────────
+
+    def _toggle_rvc(self):
+        if self._current_tab != "tts":
+            return
+        self._rvc_active = not self._rvc_active
+        if self._rvc_active:
+            self._rvc_label.config(text="RVC: ON", fg=COLORS["accent"])
+        else:
+            self._rvc_label.config(text="RVC: OFF", fg=COLORS["text_dim"])
+        self._emit_mode()
+
+    def _update_rvc_clickable(self):
+        """RVC selalu clickable di tab TTS+RVC (tidak tergantung mic)."""
+        if self._current_tab == "tts":
+            self._rvc_label.config(
+                fg=COLORS["accent"] if self._rvc_active else COLORS["text_dim"],
+                cursor="hand2",
+            )
+
+    # ── Mode emit ──────────────────────────────────────────────────
+
+    def _emit_mode(self):
+        mode = self._compute_mode()
+        self._on_mode_change(mode)
+
+    def _compute_mode(self) -> str:
+        if self._current_tab == "text":
+            return "5" if self._mic_active else "1"
+        else:  # tts
+            if self._mic_active:
+                base = "3"   # STT + TTS
+            else:
+                base = "2"   # Text + TTS
+            # RVC bisa aktif di semua mode TTS (mic on/off)
+            return base + "r" if self._rvc_active else base
+
+    # ── Public API ─────────────────────────────────────────────────
 
     def set_status(self, text: str, color: str = None):
         self._status.config(text=text, fg=color or COLORS["text_dim"])
 
     @property
     def current_mode(self) -> str:
-        return self._current_mode
+        return self._compute_mode()
 
     @property
     def mic_active(self) -> bool:
         return self._mic_active
+
+    @property
+    def rvc_active(self) -> bool:
+        return self._rvc_active
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -789,22 +884,33 @@ class MEIApp:
     # ── Mode ───────────────────────────────────────────────────────
 
     def _on_mode_change(self, mode: str):
-        labels = {"1": "Text", "2": "TTS", "3": "STT", "4": "STT+RVC"}
-        self.chat.add_system(f"Mode: {labels.get(mode, mode)}")
-        self._ui("set_status", {"text": f"mode {labels.get(mode, mode)}", "color": COLORS["text_dim"]})
+        labels = {
+            "1" : "Text",
+            "2" : "TTS",
+            "2r": "TTS+RVC",
+            "3" : "STT+TTS",
+            "3r": "STT+TTS+RVC",
+            "5" : "STT→Text",
+        }
+        label = labels.get(mode, mode)
+        self.chat.add_system(f"Mode: {label}")
+        self._ui("set_status", {"text": label, "color": COLORS["text_dim"]})
 
+        # STT aktif kalau mode pakai voice input
         if self.mode_bar.mic_active:
             self._stop_stt()
-            if mode in ("3", "4"):
+            if mode in ("3", "3r", "5"):
                 self._start_stt()
 
     # ── Mic / STT ──────────────────────────────────────────────────
 
     def _on_mic_toggle(self, active: bool):
+        """Dipanggil ModeBar saat mic di-toggle. Handle STT start/stop."""
         if active:
             self.chat.add_system("Mic aktif — mendengarkan...")
             self._ui("set_status", {"text": "🎙 mendengarkan", "color": COLORS["mic_on"]})
-            self._start_stt()
+            if self.mode_bar.current_mode in ("3", "3r", "5"):
+                self._start_stt()
         else:
             self.chat.add_system("Mic nonaktif")
             self._ui("set_status", {"text": "mic off", "color": COLORS["text_dim"]})
