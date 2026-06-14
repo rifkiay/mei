@@ -1,6 +1,26 @@
 """
 MEI — AI Personal Assistant
 =============================
+Version 4.5.18
+
+Perubahan v4.5.18:
+  - FIX: Bug filter noise kontradiktif — blok `elif relevance >= 0.30` dalam
+    `elif relevance >= RELEVANCE_MEDIUM (0.30)` selalu True, menyebabkan semua
+    dokumen >= 0.30 lolos tanpa filter kata bermakna. Diganti dengan satu hard
+    threshold RELEVANCE_THRESHOLD = 0.42.
+  - ADD: _build_chroma_query() — SLM Call #0 sebelum ChromaDB saat trigger aktif.
+    User input mentah dibersihkan menjadi query ringkas 3-8 kata agar embedding
+    lebih akurat. Hanya dipanggil saat trigger aktif & GPU mode & kalimat >= 4 kata.
+    Timeout 3 detik, max_tokens 20, fallback ke user_input jika gagal.
+  - FIX: Pool MMR terlalu kecil — n_results sekarang top_k * 4 (GPU) / 2 (CPU)
+    agar MMR punya cukup kandidat untuk diversifikasi.
+  - FIX: CPU mode top_k terbalik — sebelumnya `1 if not use_gpu else top_k`,
+    seharusnya CPU dapat pool lebih kecil tapi bukan 1 (1 tidak bisa MMR).
+  - ADD: Metadata topic + confirmed di add_memory via FactExtractor sudah ada,
+    tapi _process_turn sekarang log query yang dipakai ke ChromaDB (_last_chroma_query)
+    untuk debugging.
+  - CLEAN: Hapus debug print `[DEBUG TURN]` yang tertinggal di _process_turn.
+
 Version 4.5.17
 
 Perubahan v4.5.17:
@@ -285,33 +305,26 @@ GT_DATASET = [
     ( 1, "Hai, nama saya Rifki Ainul, saya seorang backend developer.",             "data_pribadi",  9,  None),
     ( 3, "Senang banget punya asisten AI yang bisa diajak ngobrol gini.",           "tidak_penting", 1,  None),
     ( 5, "Btw kamu tahu kan nama gue siapa?",                                       "tidak_penting", 1,  None),
-    # ↑ MULTI-TURN TEST: T5 trigger nama, T1 masih dalam window GPU & CPU → kedua mode harus 1.0
     ( 7, "Oh ya, tolong cek jadwal kerja saya hari ini dong.",                      "pekerjaan",     8,  "get_events"),
-    ( 9, "Foto CV saya ini ya, biar kamu tahu background pengalaman saya.",         "pengalaman",    6,  "camera_capture"),
+    ( 9, "Foto muka saya buat dimasukin ke cv",                                     "lainnya",    6,  "camera_capture"),
     (11, "Tolong buatin event 'Sprint Planning' untuk besok jam 9 pagi.",           "project",       8,  "create_event"),
     (13, "Eh btw event Sprint Planning tadi berhasil ke-create kan?",               "project",       7,  None),
-    # ↑ MULTI-TURN TEST: T13 merujuk T11, dalam window GPU & CPU
     (15, "Cari info tentang Kong API Gateway dong, buat referensi project saya.",   "teknis",        7,  "internet_search"),
     (17, "Hasilnya gimana? Ada yang relevan buat architecture project saya?",       "teknis",        7,  None),
-    # ↑ MULTI-TURN TEST: T17 follow-up dari T15
     (19, "Cek jadwal saya minggu ini, saya biasanya prefer meeting pagi.",          "preferensi",    7,  "get_events"),
     (21, "Haha seru juga, set timer 5 menit dulu ah buat jeda sebentar.",           "tidak_penting", 1,  "set_timer"),
-    # ↑ T21: topik baru → Context Retention 1.0 otomatis
     (23, "Ngomong-ngomong, apa ya perbedaan REST API dan GraphQL?",                 "teknis",        7,  "internet_search"),
     (25, "Oke ngerti. Nah terus mana yang lebih cocok buat project API saya?",     "teknis",        8,  None),
-    # ↑ MULTI-TURN TEST: T25 merujuk T23
     (27, "Nomor HP saya 0812-1234-0000, kalau perlu dihubungi.",                    "data_pribadi",  9,  None),
     (29, "Saya sudah 4 tahun pengalaman di web development, fokusnya di backend.",  "pengalaman",    6,  None),
     (31, "Tolong foto diagram arsitektur project yang ada di papan tulis ini.",     "project",       8,  "camera_capture"),
     (33, "Set timer 25 menit buat sesi Pomodoro coding sekarang.",                  "lainnya",       5,  "set_timer"),
     (35, "Cari tutorial cara setup Docker di Ubuntu 22.04 dong.",                   "teknis",        7,  "internet_search"),
     (37, "Oke, gue mau langsung praktek. Buatin meeting sama tim buat review, Kamis jam 2.", "pekerjaan", 8, "create_event"),
-    # ↑ T37: switch topik → Context Retention 1.0 otomatis
     (39, "Ada event apa saja yang terjadwal minggu ini?",                           "pekerjaan",     8,  "get_events"),
     (41, "Bikin event standup harian rutin tiap Senin sampai Jumat jam 8 pagi.",    "preferensi",    7,  "create_event"),
     (43, "Set timer 30 menit buat sesi review kode project API ini.",               "project",       8,  "set_timer"),
     (45, "Oke, ngerti sekarang. Makasih ya infonya.",                               "tidak_penting", 1,  None),
-    # ↑ T45: basa-basi → Context Retention 1.0 otomatis
     (47, "Oh ya, email kantor saya rifki@devstudio.id.",                             "data_pribadi",  9,  None),
     (49, "Foto pesan error di terminal ini, tolong bantu analisis masalahnya.",     "lainnya",       5,  "camera_capture"),
     (51, "Bikin reminder 'Demo ke Klien' untuk Jumat jam 3 sore.",                   "pekerjaan",     8,  "create_event"),
@@ -319,12 +332,9 @@ GT_DATASET = [
     (55, "Foto halaman portfolio project lama saya ini buat referensi.",            "pengalaman",    6,  "camera_capture"),
     (57, "Cek jadwal besok pagi, saya prefer mulai aktivitas dari jam 8.",          "preferensi",    7,  "get_events"),
     (59, "Btw gue prefer meeting pagi, kamu tahu kan dari obrolan tadi?",           "preferensi",    7,  None),
-    # ↑ MULTI-TURN TEST: T59 merujuk T19/T57
     (61, "Sip, segitu dulu untuk sekarang. Nanti lanjut lagi.",                     "tidak_penting", 1,  None),
-    # ↑ T61: basa-basi penutup → semua dimensi 1.0 otomatis
 ]
 
-# ── v4.5.5: GT lookup dict (turn_no → metadata) ─────────────────
 gt_by_turn: dict[int, dict] = {
     turn_no: {"label_gt": label, "importance": imp, "tool_gt": tool}
     for turn_no, _, label, imp, tool in GT_DATASET
@@ -336,45 +346,55 @@ gt_by_turn: dict[int, dict] = {
 # ══════════════════════════════════════════════════════════════════
 
 CHROMA_TEST_QUERIES = [
-    # q01 — jadwal standup (tidak ada di memory.md)
-    ('q01', 'Kamu masih ingat jadwal standup rutin saya itu hari apa dan jam berapa?',
-     ['Senin', 'jam 8']),
+    # q01 — standup rutin (1 fakta relevan)
+    ('q01',
+     'Jam berapa Rifki biasanya mulai standup pagi?',
+     'Rifki mulai harinya dengan standup setiap pagi dari Senin sampai Jumat, jam 8.'),
 
-    # q02 — teknologi environment (tidak ada di memory.md)
-    ('q02', 'Kamu ingat teknologi apa yang saya pakai untuk environment development saya?',
-     ['Docker', 'Ubuntu']),
+    # q02 — meeting klien (1 fakta relevan)
+    ('q02',
+     'Kapan Rifki ada meeting rutin sama klien?',
+     'Setiap Kamis jam 2 siang Rifki ada meeting rutin sama klien.'),
 
-    # q03 — metode coding (tidak ada di memory.md)
-    ('q03', 'Saya pernah bilang soal metode kerja saya buat sesi coding. Apa itu?',
-     ['Pomodoro', '25 menit']),
+    # q03 — demo klien (1 fakta relevan)
+    ('q03',
+     'Kapan biasanya Rifki demo progress ke klien?',
+     'Tiap Jumat sore jam 3 biasanya Rifki demo progress ke klien.'),
 
-    # q04 — project (tidak ada di memory.md — bukan MEI/skripsi)
-    ('q04', 'Saya pernah cerita soal project yang lagi saya kerjakan. Itu tentang apa?',
-     ['Kong', 'API Gateway']),
+    # q04 — preferensi mulai kerja (2 fakta relevan: iid(3) + iid(4))
+    ('q04',
+     'Jam berapa Rifki prefer mulai kerja?',
+     'Rifki lebih suka mulai kerja dari jam 8 pagi. Kalau ada meeting, Rifki prefer jadwalnya di pagi hari, sekitar jam 8-9.'),
 
-    # q05 — jadwal meeting klien (tidak ada di memory.md)
-    ('q05', 'Ingatkan saya, jadwal meeting rutin dengan klien itu hari apa dan jam berapa?',
-     ['Kamis', 'jam 2']),
+    # q05 — teknologi sehari-hari (3 fakta relevan: iid(5) + iid(6) + iid(7))
+    ('q05',
+     'Tools atau teknologi apa yang dipakai Rifki sehari-hari untuk development?',
+     'Untuk development sehari-hari, Rifki pakai Docker sama Ubuntu 22.04. Rifki lagi ngerjain JWT authentication di Node.js. Backend service yang lagi dikerjain Rifki pakai Express.js sama PostgreSQL.'),
 
-    # q06 — jadwal demo (tidak ada di memory.md)
-    ('q06', 'Kamu masih ingat jadwal demo saya ke klien itu kapan?',
-     ['Jumat', 'jam 3']),
+    # q06 — autentikasi (1 fakta relevan: iid(6))
+    ('q06',
+     'Apa yang Rifki kerjakan sekarang terkait autentikasi?',
+     'Rifki lagi ngerjain JWT authentication di Node.js buat project yang baru.'),
 
-    # q07 — pengalaman kerja (memory.md bilang Mahasiswa, bukan backend developer)
-    ('q07', 'Berapa tahun pengalaman saya di web development yang sudah saya ceritakan dulu?',
-     ['4 tahun', 'backend']),
+    # q07 — workflow coding dan Git (2 fakta relevan: iid(8) + iid(9))
+    ('q07',
+     'Gimana workflow coding dan Git Rifki?',
+     'Rifki pakai Git flow, tiap fitur punya branch sendiri lalu PR review sebelum merge. Waktu coding, Rifki suka pakai Pomodoro, sesi 25 menit.'),
 
-    # q08 — preferensi meeting (tidak ada di memory.md)
-    ('q08', 'Kamu ingat preferensi jam meeting saya? Saya biasanya prefer mulai jam berapa?',
-     ['pagi', 'jam 8', 'jam 9']),
+    # q08 — project sekarang (2 fakta relevan: iid(12) + iid(14))
+    ('q08',
+     'Project apa yang lagi dikerjain Rifki sekarang?',
+     'Rifki lagi handle project API Gateway berbasis Kong, buat klien enterprise. Project API Gateway yang Rifki kerjain sekarang lagi di tahap code review.'),
 
-    # q09 — tempat kerja (memory.md bilang Mahasiswa, bukan DevStudio)
-    ('q09', 'Saya pernah cerita soal pekerjaan dan tempat kerja saya yang sekarang. Apa itu?',
-     ['DevStudio', 'backend developer']),
+    # q09 — pekerjaan dan posisi (1 fakta relevan: iid(16))
+    ('q09',
+     'Dimana Rifki kerja dan apa posisinya?',
+     'Rifki kerja sebagai backend developer di DevStudio.'),
 
-    # q10 — teknologi backend spesifik (tidak ada di memory.md)
-    ('q10', 'Kamu ingat stack teknologi backend yang saya pakai di project saya?',
-     ['Express', 'PostgreSQL']),
+    # q10 — pengalaman web dev (2 fakta relevan: iid(17) + iid(19))
+    ('q10',
+     'Berapa lama pengalaman Rifki di web development?',
+     'Rifki udah 4 tahun di web development, fokusnya di backend. Rifki punya beberapa portfolio aplikasi web backend dari project-project sebelumnya.'),
 ]
 
 CHROMA_JSONL_PATH = SRC_DIR / 'debug' /'mei_chroma.jsonl'
@@ -612,21 +632,32 @@ def _generate_daily_summary_llm(messages: list[dict], llm_config: dict) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 EPISODIC_TRIGGERS = [
-    "ingat", "inget", "kemarin", "kemaren", "dulu", "waktu itu", "pernah",
-    "sebelumnya", "sebelum ini", "lupa", "remind", "tadi", "minggu lalu",
-    "bulan lalu", "sudah pernah", "udah pernah", "ceritanya", "katanya",
-    "tempo hari", "beberapa waktu", "belum lama", "awal tadi",
-    "kamu tau", "kamu tahu", "kau tau", "kau tahu",
+    # ── Recall eksplisit — high confidence, langsung trigger ──────
+    "ingat", "inget", "masih ingat", "masih inget",
+    "kemarin", "kemaren", "dulu", "waktu itu", "pernah",
+    "sebelumnya", "sebelum ini", "lupa", "tadi", "minggu lalu",
+    "bulan lalu", "sudah pernah", "udah pernah",
+    "tempo hari", "beberapa waktu", "belum lama",
     "aku pernah", "gue pernah", "saya pernah",
     "kita pernah", "kita udah", "kita sudah",
     "pernah bilang", "pernah ngomong", "pernah cerita",
     "udah bahas", "sudah bahas", "udah diskusi", "sudah diskusi",
     "yang kemarin", "yang tadi", "yang dulu",
-    "balik lagi", "balik ke",
-    "masih inget", "masih ingat",
     "lanjut dari", "lanjutin dari",
-    "januari", "februari", "maret", "april", "mei", "juni",
+    "ingatkan saya", "remind me",
+]
+
+# Keyword ambiguous — trigger HANYA setelah lolos intent classifier
+EPISODIC_TRIGGERS_AMBIGUOUS = [
+    "januari", "februari", "maret", "april", "juni",
     "juli", "agustus", "september", "oktober", "november", "desember",
+    "jadwal", "meeting", "standup", "sprint", "demo",
+    "biasanya", "prefer", "kebiasaan", "rutinitas",
+    "teknologi", "tools", "stack", "framework", "backend",
+    "project", "projek", "deployment", "staging",
+    "pengalaman", "berapa tahun", "portfolio",
+    "kerja", "kerjaan", "pekerjaan", "kantor",
+    "docker", "git", "express", "postgresql", "jwt", "kong",
 ]
 
 _EPISODIC_PATTERNS: list[re.Pattern] = [
@@ -641,26 +672,162 @@ _EPISODIC_PATTERNS: list[re.Pattern] = [
     re.compile(r'\btanggal\s+\d{1,2}\b', re.I),
     re.compile(r'\b\d{1,2}\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\b', re.I),
     re.compile(r'\b(minggu|bulan|tahun|pekan)\s+(lalu|kemarin|sebelumnya)\b', re.I),
-    re.compile(r'\b(waktu|pas|saat)\s+\w+\s*(lalu|kemarin|dulu|tadi)?\b', re.I),
     re.compile(r'apa\s+yang\s+(terjadi|dibahas|kita|aku|gue|sudah|udah)', re.I),
 ]
 
-def _should_search_episodic(text: str) -> bool:
+# ── Intent classifier cache — hindari LLM call untuk query yang sama ──
+_intent_cache: dict[str, bool] = {}
+
+
+def _classify_intent_llm(text: str, llm_cfg: dict) -> bool:
+    """
+    Tanya LLM apakah query ini membutuhkan recall memori personal user.
+    Return True  = perlu cari di ChromaDB.
+    Return False = query umum / tidak perlu memori personal.
+
+    Dipanggil HANYA untuk query ambiguous (match EPISODIC_TRIGGERS_AMBIGUOUS
+    tapi tidak match EPISODIC_TRIGGERS eksplisit).
+    """
+    cache_key = text.strip().lower()[:120]
+    if cache_key in _intent_cache:
+        return _intent_cache[cache_key]
+
+    prompt = (
+        "Tugasmu: klasifikasi apakah pertanyaan berikut membutuhkan recall "
+        "informasi personal tentang user (fakta pribadi, jadwal, pekerjaan, "
+        "kebiasaan, project, preferensi yang pernah disebutkan user sebelumnya).\n\n"
+        "Jawab HANYA dengan satu kata: YES atau NO.\n\n"
+        "Contoh YES: 'Kamu ingat stack yang aku pakai?' / 'Jadwal meeting gue kapan?'\n"
+        "Contoh NO: 'Apa itu Docker?' / 'Gimana cara setup JWT?' / 'Cuaca hari ini'\n\n"
+        f"Pertanyaan: {text}\n\nJawab:"
+    )
+    try:
+        resp = requests.post(
+            f"{llm_cfg['model_server']}/chat/completions",
+            headers={"Authorization": f"Bearer {llm_cfg.get('api_key', 'lm-studio')}"},
+            json={
+                "model"      : llm_cfg["model"],
+                "messages"   : [{"role": "user", "content": prompt}],
+                "max_tokens" : 5,
+                "temperature": 0.0,
+            },
+            timeout=4,   # harus cepat, jangan blok UI
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+        result = answer.startswith("Y")
+        _intent_cache[cache_key] = result
+        _dbg(f"Intent classifier: '{text[:50]}' → {'RECALL' if result else 'GENERAL'}")
+        return result
+    except Exception as e:
+        _dbg(f"Intent classifier gagal ({e}), fallback ke True")
+        # Gagal → safe fallback: anggap perlu recall (lebih baik false positive
+        # daripada miss recall yang user harapkan)
+        return True
+
+
+def _should_search_episodic(text: str, llm_cfg: dict | None = None) -> bool:
+    """
+    2-layer hybrid trigger:
+    Layer 1 — Keyword eksplisit & regex: langsung True, zero latency.
+    Layer 2 — Keyword ambiguous: tanya LLM intent classifier dulu.
+              Kalau llm_cfg tidak tersedia, fallback ke True (safe).
+    """
     low = text.lower()
 
-    # debug
-    print(f"  [DEBUG EPIS] text='{low[:60]}'", flush=True)
-    matched_kw = [t for t in EPISODIC_TRIGGERS if t in low]
-    print(f"  [DEBUG EPIS] matched_kw={matched_kw}", flush=True)
-
+    # Layer 1A: keyword recall eksplisit — high confidence
     if any(trigger in low for trigger in EPISODIC_TRIGGERS):
-        _dbg(f"Episodic trigger: keyword match")
+        _dbg("Episodic trigger: keyword eksplisit")
         return True
+
+    # Layer 1B: regex patterns — high confidence
     for pattern in _EPISODIC_PATTERNS:
         if pattern.search(text):
-            _dbg(f"Episodic trigger: pattern match [{pattern.pattern[:40]}]")
+            _dbg(f"Episodic trigger: pattern [{pattern.pattern[:40]}]")
             return True
+
+    # Layer 2: keyword ambiguous — perlu intent classifier
+    if any(trigger in low for trigger in EPISODIC_TRIGGERS_AMBIGUOUS):
+        _dbg(f"Episodic trigger: ambiguous keyword, cek intent...")
+        if llm_cfg:
+            return _classify_intent_llm(text, llm_cfg)
+        # Tanpa LLM cfg (CPU mode / test) → false agar tidak false positive
+        _dbg("Episodic trigger: tidak ada llm_cfg, skip ambiguous")
+        return False
+
     return False
+
+
+# ══════════════════════════════════════════════════════════════════
+# CHROMA QUERY BUILDER  (v4.5.18)
+# ══════════════════════════════════════════════════════════════════
+
+# Cache agar kalimat yang sama tidak memanggil SLM dua kali
+_chroma_query_cache: dict[str, str] = {}
+
+def _build_chroma_query(user_input: str, llm_cfg: dict | None) -> str:
+    """
+    SLM Call #0 — dipanggil HANYA saat trigger ChromaDB aktif.
+
+    Membersihkan user_input mentah menjadi query ringkas 3-8 kata
+    sehingga embedding lebih akurat dan noise berkurang.
+
+    Contoh:
+      "Btw gue prefer meeting pagi, kamu tahu kan dari obrolan tadi?"
+      → "preferensi meeting pagi rifki"
+
+    Fallback ke user_input jika:
+      - llm_cfg tidak tersedia (CPU mode)
+      - kalimat < 4 kata (sudah ringkas)
+      - LLM call gagal / timeout
+      - Hasil lebih pendek dari 3 karakter
+    """
+    # Kalimat pendek tidak perlu dibersihkan
+    if len(user_input.split()) < 4:
+        return user_input
+
+    # Gunakan cache agar tidak memanggil SLM untuk input yang sama
+    cache_key = user_input.strip().lower()[:150]
+    if cache_key in _chroma_query_cache:
+        cached = _chroma_query_cache[cache_key]
+        _dbg(f"Chroma query (cached): '{cached}'")
+        return cached
+
+    if not llm_cfg:
+        return user_input
+
+    prompt = (
+        "Ekstrak inti pencarian menjadi query pendek 3-8 kata "
+        "untuk mencari fakta personal di database memori.\n"
+        "Fokus: nama, preferensi, jadwal, teknologi, pekerjaan.\n"
+        "Hapus: sapaan, filler word, pertanyaan retoris.\n\n"
+        f"Input: {user_input}\n"
+        "Query (langsung jawab tanpa penjelasan):"
+    )
+    try:
+        resp = requests.post(
+            f"{llm_cfg['model_server']}/chat/completions",
+            headers={"Authorization": f"Bearer {llm_cfg.get('api_key', 'lm-studio')}"},
+            json={
+                "model"      : llm_cfg["model"],
+                "messages"   : [{"role": "user", "content": prompt}],
+                "max_tokens" : 20,
+                "temperature": 0.0,
+            },
+            timeout=3,
+        )
+        resp.raise_for_status()
+        clean = resp.json()["choices"][0]["message"]["content"].strip()
+        # Buang tanda kutip kalau SLM membungkus hasilnya
+        clean = clean.strip('"\'')
+        if len(clean) > 3:
+            _chroma_query_cache[cache_key] = clean
+            _log(f"ChromaDB query expansion: '{user_input[:50]}' → '{clean}'")
+            return clean
+    except Exception as e:
+        _dbg(f"_build_chroma_query gagal ({e}), fallback ke user_input")
+
+    return user_input
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -768,13 +935,31 @@ def build_system_message(
             msg += f"\n\n{sep}\nKONTEKS TERAKHIR:\n{sep}\n"
             for m in filtered_recent:
                 msg += f"[{m.get('role','?').upper()}] {m.get('content','')[:80]}\n"
-        msg += f"\n\n{sep}\nMEMORI EPISODIK RELEVAN:\n{sep}\n"
+
+    if episodic_hits:
+        msg += f"\n\n{sep}\nMEMORI EPISODIK — PRIORITAS TERTINGGI:\n{sep}\n"
+        msg += (
+            "ATURAN WAJIB:\n"
+            "1. Fakta di bawah SUDAH PASTI BENAR dan LEBIH SPESIFIK dari PROFIL USER "
+            "di atas — jika ada konflik, gunakan fakta di bawah ini.\n"
+            "2. SEBUTKAN DETAIL SPESIFIK dari fakta ini (nama teknologi, jam, hari, "
+            "nama tempat/perusahaan) — jangan parafrase samar atau generalisasi.\n"
+            "3. DILARANG bilang 'saya tidak ingat' atau 'tidak ada informasi' jika "
+            "jawabannya sudah ada di fakta ini.\n"
+            "4. DILARANG melakukan internet search untuk informasi yang sudah ada di "
+            "fakta ini.\n"
+            "5. Hasil tool/kalender boleh dipakai untuk info real-time (event hari ini), "
+            "tapi fakta personal user tetap dari memori ini.\n\n"
+            "FAKTA YANG DIKETAHUI TENTANG USER:\n"
+        )
         for hit in episodic_hits:
             relevance = round(1 - hit["distance"], 2)
-            msg += (
-                f"- [{hit.get('label', hit['memory_type'])}] {hit['content']} "
-                f"(tanggal: {hit['date']}, relevance: {relevance})\n"
-            )
+            label     = hit.get('label', hit['memory_type'])
+            msg += f"  [{label}] {hit['content']}  (relevansi={relevance})\n"
+        msg += (
+            "\nGUNAKAN fakta di atas. Sebutkan nama, angka, dan detail spesifik "
+            "yang ada — jangan jawab samar jika datanya tersedia.\n"
+        )
 
     if last_tool_used:
         hint = _TOOL_HINT.get(last_tool_used)
@@ -1149,6 +1334,8 @@ def _synthesize_and_play(
     if intr and intr.event.is_set():
         return 0.0
     t0 = time.perf_counter()
+    rvc_ms  = 0.0
+    play_ms = 0.0
     try:
         wav_bytes, _ = vs.tts.get_audio_bytes(text)
         tts_ms = (time.perf_counter() - t0) * 1000
@@ -1156,21 +1343,25 @@ def _synthesize_and_play(
         with audio_lock:
             if intr and intr.event.is_set():
                 return 0.0
-            t1 = time.perf_counter()
             if io_state.use_rvc and vs.rvc:
-                vs.rvc.speak_bytes(wav_bytes)
+                # speak_bytes() return dict: {convert_ms, play_ms, ...}
+                rvc_metrics = vs.rvc.speak_bytes(wav_bytes)
+                rvc_ms  = rvc_metrics.get("convert_ms", 0.0)
+                play_ms = rvc_metrics.get("play_ms",    0.0)
             else:
+                t1 = time.perf_counter()
                 _play_wav_bytes(wav_bytes, intr)
-            playback_ms = (time.perf_counter() - t1) * 1000
+                play_ms = (time.perf_counter() - t1) * 1000
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        _dbg(f"TTS chunk: synthesis={tts_ms:.0f}ms playback={playback_ms:.0f}ms total={elapsed_ms:.0f}ms")
+        _dbg(f"TTS chunk: synthesis={tts_ms:.0f}ms rvc={rvc_ms:.0f}ms play={play_ms:.0f}ms total={elapsed_ms:.0f}ms")
     except Exception as e:
         print(f"\n[TTS/RVC error] {e}", flush=True)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
     if tracker is not None:
-        tracker.mark_tts_chunk(text, elapsed_ms)
+        # synthesis_ms = tts_ms murni (text→wav saja), bukan elapsed total
+        tracker.mark_tts_chunk(text, tts_ms, rvc_ms=rvc_ms, play_ms=play_ms)
     return elapsed_ms
 
 
@@ -1396,12 +1587,13 @@ def _stream_and_speak(
 def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
     s = lt_mem.stats()
     print("\n" + "=" * 60)
-    print("MEI — Personal Assistant v4.5.16")
+    print("MEI — Personal Assistant v4.5.19")
     print("=" * 60)
     print(f"  User        : {USER_ID}")
     print(f"  Short-term  : JSONL window {MEMORY_CONFIG['window_size']} turn")
     print(f"  Long-term   : MEMORY.md (manual) + PROFILE_AGENT.md + ChromaDB")
-    print(f"  Episodic DB : {s['total_memories']} memories")
+    bm25_status = "ON (rank_bm25)" if s.get("bm25_available") else "OFF (pip install rank_bm25)"
+    print(f"  Episodic DB : {s['total_memories']} memories  |  BM25 hybrid: {bm25_status}")
     print(f"  Voice       : {'STT+TTS ready (streaming)' if vs.voice_ok else 'disabled'}")
     if vs.rvc_ok:
         print(f"  RVC         : {RVC_CONFIG.model_name}")
@@ -1430,7 +1622,7 @@ def _print_banner(lt_mem, vs: VoiceState, io_state: IOState):
     print("    1: Text→Text  2: Text→TTS  3: STT→TTS  4: STT→TTS+RVC  5: STT→Text")
     print("  gpu / cpu                — ganti hardware target")
     print("  debug on/off             — toggle debug tool logging")
-    print("  test                     — jalankan 27 GT input otomatis (semua)")
+    print("  test                     — jalankan N(total) GT input otomatis (semua)")
     print("  test N                   — mulai dari GT input ke-N (1-27)")
     print("  test info                — tampilkan daftar GT dataset")
     print("  test chroma              — jalankan 10 query ChromaDB → mei_chroma.jsonl")
@@ -1553,19 +1745,62 @@ def _process_turn(
 
         episodic_hits    = []
         chroma_triggered = False
+        _chroma_query_used = ""   # v4.5.18: untuk debugging
         tracker.mark_pre_step("memory_read")
-        if _should_search_episodic(user_input):
+        if _should_search_episodic(user_input, llm_cfg=LLM_CONFIG if io_state.use_gpu else None):
             chroma_triggered = True
             _log(f"ChromaDB: trigger terdeteksi, mencari...")
-            top_k    = 1 if not io_state.use_gpu else MEMORY_CONFIG["top_k"]
-            raw_hits = lt_mem.search(
-                query          = user_input,
-                n_results      = top_k,
-                # min_importance = 6,
+
+            # ── FIX #1 & #2 (v4.5.18): SLM Call #0 — bersihkan query sebelum ChromaDB ──
+            # User input mentah sering mengandung filler ("btw", "kamu tahu kan", dll)
+            # yang mengacaukan embedding. _build_chroma_query() meminta SLM membuat
+            # query ringkas 3-8 kata. Hanya aktif di GPU mode (ada llm_cfg).
+            _chroma_query_used = _build_chroma_query(
+                user_input,
+                llm_cfg = LLM_CONFIG if io_state.use_gpu else None,
             )
-            episodic_hits = raw_hits[:MEMORY_CONFIG["max_longterm_memories"]]
+
+            # ── FIX #3 (v4.5.18): Pool MMR diperbesar ──────────────────────────
+            # GPU: fetch top_k * 4 agar MMR punya cukup kandidat untuk diversifikasi.
+            # CPU: fetch top_k * 2 (lebih hemat, MMR tetap bisa jalan).
+            # Sebelumnya: top_k = 1 saat CPU (tidak bisa MMR sama sekali).
+            _cfg_top_k = MEMORY_CONFIG["top_k"]
+            fetch_k    = _cfg_top_k * 4 if io_state.use_gpu else max(_cfg_top_k * 2, 4)
+
+            # v4.5.19: tambah use_bm25=True untuk BM25 hybrid retrieval
+            # (long_term_memory v4.2.0). Fallback otomatis ke cosine-only
+            # jika rank_bm25 belum terinstall.
+            raw_hits = lt_mem.search(
+                query       = _chroma_query_used,
+                n_results   = fetch_k,
+                use_mmr     = True,
+                mmr_lambda  = 0.65,
+                use_bm25    = True,
+                bm25_weight = 0.3,
+            )
+
+            # ── FIX #4 (v4.5.18): Hard threshold — tidak ada negosiasi di bawah ini ──
+            # Threshold 0.42 empiris untuk paraphrase-multilingual-mpnet-base-v2.
+            # Dokumen di bawah threshold ini hampir pasti noise untuk percakapan harian.
+            # BUG LAMA dihapus: blok `elif relevance >= 0.30` dalam `elif >= MEDIUM`
+            # sebelumnya selalu True sehingga filter kata bermakna tidak punya efek.
+            RELEVANCE_THRESHOLD = 0.42
+
+            filtered_hits = []
+            for h in raw_hits:
+                relevance = round(1 - h["distance"], 2)
+                if relevance >= RELEVANCE_THRESHOLD:
+                    filtered_hits.append(h)
+                else:
+                    _dbg(
+                        f"ChromaDB noise dibuang: relevance={relevance} "
+                        f"| {h['content'][:60].replace(chr(10), ' ')}"
+                    )
+
+            episodic_hits = filtered_hits[:MEMORY_CONFIG["max_longterm_memories"]]
             if episodic_hits:
-                _log(f"ChromaDB: {len(episodic_hits)} hasil diinjek ke prompt:")
+                _log(f"ChromaDB: {len(episodic_hits)} hasil diinjek ke prompt "
+                     f"(query='{_chroma_query_used[:40]}'):")
                 for i, hit in enumerate(episodic_hits, 1):
                     label     = hit.get("label", hit.get("memory_type", "?"))
                     relevance = round(1 - hit["distance"], 2)
@@ -1577,11 +1812,10 @@ def _process_turn(
             _log("ChromaDB: tidak ada trigger, skip")
         tracker.mark_pre_step_done("memory_read")
 
-        # ── v4.5.7: expose chroma result ke shared ────────────────
+        # ── v4.5.7+: expose chroma result ke shared ───────────────
+        # v4.5.18: tambah _last_chroma_query untuk debugging
         shared['_last_chroma_triggered'] = chroma_triggered
-        # TAMBAH INI
-        print(f"  [DEBUG TURN] chroma_triggered={chroma_triggered} hits={len(episodic_hits)}", flush=True)
-
+        shared['_last_chroma_query']     = _chroma_query_used
         shared['_last_chroma_hits']      = len(episodic_hits)
         shared['_last_hit_contents']     = [h['content'] for h in episodic_hits]
         shared['_last_hit_relevances']   = [round(1 - h['distance'], 4) for h in episodic_hits]
@@ -1841,21 +2075,28 @@ def _run_chroma_test(
 
     results = []
 
-    for idx, (qid, query, expected_keywords) in enumerate(CHROMA_TEST_QUERIES):
+    for idx, (qid, query, expected_answer) in enumerate(CHROMA_TEST_QUERIES):
         if stop_event.is_set():
             break
 
         print(f"\n{'─'*60}")
         print(f"  [{qid}] {query}")
-        print(f"  Expected kw : {expected_keywords}")
         print(f"{'─'*60}")
 
-        _saved_history    = shared['conversation_history'][:]
-        _saved_tool       = shared['last_used_realtime_tool']
-        _saved_error      = shared['_last_turn_had_error']
+        # ── Simpan state asli HANYA di iterasi pertama ───────────────
+        if idx == 0:
+            _saved_history = shared['conversation_history'][:]
+            _saved_tool    = shared['last_used_realtime_tool']
+            _saved_error   = shared['_last_turn_had_error']
+
+        # ── Reset SEMUA shared state agar tiap query isolated ────────
         shared['conversation_history']    = []
         shared['last_used_realtime_tool'] = None
         shared['_last_turn_had_error']    = False
+        shared['_last_chroma_triggered']  = False
+        shared['_last_chroma_hits']       = 0
+        shared['_last_hit_contents']      = []
+        shared['_last_hit_relevances']    = []
 
         tracker = LatencyTracker()
         tracker.mark_turn_start()
@@ -1882,7 +2123,7 @@ def _run_chroma_test(
         record = {
             'qid'              : qid,
             'query'            : query,
-            'expected_keywords': expected_keywords,
+            'expected_answer'  : expected_answer,
             'agent_response'   : response,
             'chroma_triggered' : shared.get('_last_chroma_triggered', False),
             'chroma_hits'      : shared.get('_last_chroma_hits', 0),
@@ -1892,21 +2133,24 @@ def _run_chroma_test(
         }
         results.append(record)
 
-        kw_found = [kw for kw in expected_keywords if kw.lower() in response.lower()]
         print(f"  chroma_triggered : {record['chroma_triggered']}")
         print(f"  chroma_hits      : {record['chroma_hits']}")
-        print(f"  kw_found         : {kw_found} / {expected_keywords}")
         print(f"  response         : {response[:120]}")
-
-        shared['conversation_history']    = _saved_history
-        shared['last_used_realtime_tool'] = _saved_tool
-        shared['_last_turn_had_error']    = _saved_error
 
         if app is not None and response:
             app.add_mei_message(f"[ChromaTest {qid}] {response[:80]}")
 
         if idx < total - 1 and not stop_event.is_set():
             time.sleep(1.0)
+
+    # ── Restore state asli setelah semua query selesai ────────────────
+    shared['conversation_history']    = _saved_history
+    shared['last_used_realtime_tool'] = _saved_tool
+    shared['_last_turn_had_error']    = _saved_error
+    shared['_last_chroma_triggered']  = False
+    shared['_last_chroma_hits']       = 0
+    shared['_last_hit_contents']      = []
+    shared['_last_hit_relevances']    = []
 
     with open(CHROMA_JSONL_PATH, 'w', encoding='utf-8') as f:
         for r in results:
@@ -1915,12 +2159,14 @@ def _run_chroma_test(
     n_triggered = sum(1 for r in results if r['chroma_triggered'])
     n_has_hits  = sum(1 for r in results if r['chroma_hits'] > 0)
 
+    avg_hits = sum(r['chroma_hits'] for r in results) / max(total, 1)
     print(f"\n{'='*60}")
-    print(f"  ✓ Chroma test selesai: {len(results)} query")
-    print(f"  ✓ Triggered   : {n_triggered}/{total}")
-    print(f"  ✓ Got hits    : {n_has_hits}/{total}")
+    print(f"  ✓ Chroma test selesai : {len(results)} query")
+    print(f"  ✓ Triggered           : {n_triggered}/{total}")
+    print(f"  ✓ Got hits            : {n_has_hits}/{total}")
+    print(f"  ✓ Avg hits per query  : {avg_hits:.1f}")
     print(f"  ✓ Disimpan → {CHROMA_JSONL_PATH}")
-    print(f"  → Buka notebook Section 10b untuk evaluasi Judge LLM")
+    print(f"  → Buka notebook untuk evaluasi Judge LLM")
     print(f"{'='*60}\n")
 
 
@@ -2020,8 +2266,7 @@ def _make_ui_stt_and_callback(
         if io_state.use_gpu:
             return "Sudah pakai GPU."
         io_state.use_gpu = True
-        fact_extractor._classifier = None
-        fact_extractor._device     = io_state.device
+        fact_extractor.set_use_gpu(True, device=io_state.device)
         set_device(io_state.device)
         _apply_cpu_token_limit(LLM_CONFIG, True)
         bot_ref[0] = bot_gpu
@@ -2039,8 +2284,7 @@ def _make_ui_stt_and_callback(
         if not io_state.use_gpu:
             return "Sudah pakai CPU."
         io_state.use_gpu = False
-        fact_extractor._classifier = None
-        fact_extractor._device     = io_state.device
+        fact_extractor.set_use_gpu(False, device=io_state.device)
         set_device(io_state.device)
         _apply_cpu_token_limit(LLM_CONFIG, False)
         bot_ref[0] = bot_cpu
@@ -2218,9 +2462,10 @@ def _make_ui_stt_and_callback(
         if cmd in ("memory", "mem"):
             s  = jsonl_mem.stats(USER_ID)
             lt = lt_mem.stats()
+            bm25_str = "BM25:ON" if lt.get("bm25_available") else "BM25:OFF"
             return (
                 f"Short-term: {s['total_turns']} turns | "
-                f"Episodic: {lt['total_memories']} memories | "
+                f"Episodic: {lt['total_memories']} memories ({bm25_str}) | "
                 f"Session msgs: {len(shared['all_session_msgs'])} | "
                 f"History: {len(shared['conversation_history'])}/{MAX_HISTORY_MESSAGES}"
             )
@@ -2353,6 +2598,11 @@ def _run_test_mode(
             )
             time.sleep(TEST_INPUT_INTERVAL_S)
 
+    # print(f"\n{'='*60}\n  TEST MODE selesai.\n{'='*60}\n", flush=True)
+    print("  [TEST] Menunggu fact extractor selesai...", flush=True)
+    fact_extractor.submit_remaining(shared["all_session_msgs"])
+    if hasattr(fact_extractor, "_queue"):
+        fact_extractor._queue.join()
     print(f"\n{'='*60}\n  TEST MODE selesai.\n{'='*60}\n", flush=True)
 
 
@@ -2822,8 +3072,7 @@ def run_agent():
                         print("  Sudah pakai GPU.\n")
                         continue
                     io_state.use_gpu = True
-                    fact_extractor._classifier = None
-                    fact_extractor._device     = io_state.device
+                    fact_extractor.set_use_gpu(True, device=io_state.device)
                     set_device(io_state.device)
                     _apply_cpu_token_limit(LLM_CONFIG, True)
                     bot_ref[0] = bot_gpu
@@ -2844,8 +3093,7 @@ def run_agent():
                         print("  Sudah pakai CPU.\n")
                         continue
                     io_state.use_gpu = False
-                    fact_extractor._classifier = None
-                    fact_extractor._device     = io_state.device
+                    fact_extractor.set_use_gpu(False, device=io_state.device)
                     set_device(io_state.device)
                     _apply_cpu_token_limit(LLM_CONFIG, False)
                     bot_ref[0] = bot_cpu

@@ -1,16 +1,41 @@
 """
-Long-Term Memory Manager — MEI v4.1.0
+Long-Term Memory Manager — MEI v4.2.0
 =======================================
-Perubahan dari v4.0.0:
-  - CHANGED: search() sekarang return field 'label' dari metadata
-    (diisi oleh FactExtractor v6.0, untuk tampilan di system prompt dan episodic command)
-  - search() tetap backward-compatible: kalau metadata tidak punya 'label',
-    fallback ke memory_type
-  - Tidak ada perubahan lain — semua logika daily notes, ChromaDB, compress tetap sama
+Perubahan dari v4.1.0:
+
+  - ADD: BM25 hybrid retrieval di search()
+    Sebelumnya search() hanya cosine similarity via ChromaDB.
+    Sekarang hasil cosine di-fuse dengan BM25 (keyword exact match)
+    menggunakan Reciprocal Rank Fusion (RRF).
+    
+    Impact: query dengan keyword spesifik (nama project, nama teknologi,
+    nama orang) yang mungkin miss di cosine sekarang lebih mudah ter-retrieve.
+    Noise dokumen yang relevan secara semantik tapi tidak punya keyword
+    penting akan turun rankingnya.
+
+    Library: rank_bm25 (pure Python, ringan, tidak butuh GPU).
+    Install: pip install rank_bm25
+    Fallback: jika rank_bm25 tidak tersedia, otomatis fallback ke
+    cosine-only seperti v4.1.0 (tidak ada breaking change).
+
+  - ADD: _bm25_tokenize() — tokenizer sederhana untuk BM25
+    Lowercase + split + buang stopword Bahasa Indonesia yang umum.
+    Tidak pakai NLTK/spaCy agar tetap ringan.
+
+  - MOD: search() — parameter baru `use_bm25` (default True)
+    Kalau False: perilaku identik dengan v4.1.0 (cosine + MMR only).
+    Kalau True: fetch lebih banyak kandidat cosine, fuse dengan BM25,
+    baru di-MMR.
+
+  - KEEP: Semua logika v4.1.0 lainnya tidak berubah.
+    (daily notes, compress, add_memory, stats, search_episodic_by_period)
+
+  - KEEP: MMR tetap berjalan setelah BM25 fusion sebagai final
+    diversification step.
 """
 
-import requests
 import re
+import requests
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -64,6 +89,104 @@ _RE_AUTO_LINE    = re.compile(r"^\s*-\s+\d{2}:\d{2}\s+\[auto\]")
 _RE_SUMMARY_LINE = re.compile(r"^\s*-\s+\d{2}:\d{2}\s+\[summary\]")
 
 
+# ══════════════════════════════════════════════════════════════════
+# BM25 HELPERS (v4.2.0)
+# ══════════════════════════════════════════════════════════════════
+
+# Stopword Bahasa Indonesia yang umum muncul di daily conversation.
+# Tidak perlu lengkap — cukup buang kata yang tidak informatif untuk retrieval.
+_BM25_STOPWORDS = {
+    "dan", "di", "ke", "yang", "dengan", "untuk", "dari", "pada", "adalah",
+    "ini", "itu", "ada", "tidak", "ya", "atau", "juga", "sudah", "saya",
+    "aku", "gue", "gw", "kamu", "kau", "lo", "kami", "kita", "mereka",
+    "dia", "beliau", "si", "sang", "para", "akan", "bisa", "bisa", "jadi",
+    "kalau", "karena", "tapi", "namun", "mau", "ingin", "perlu", "harus",
+    "the", "a", "an", "is", "in", "of", "to", "for", "and", "or", "that",
+    "ini", "itu", "nya", "lah", "pun", "pula", "sih", "nih", "deh", "dong",
+    "user", "rifki",  # nama user — terlalu umum di semua dokumen
+}
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    """
+    Tokenizer sederhana untuk BM25.
+    Lowercase → split whitespace/punctuation → buang stopword → buang token pendek.
+    
+    Sengaja dibuat ringan tanpa NLTK/spaCy agar tidak menambah dependency.
+    """
+    text   = text.lower()
+    tokens = re.findall(r"[a-z0-9][a-z0-9\-_\.]*[a-z0-9]|[a-z0-9]", text)
+    return [t for t in tokens if t not in _BM25_STOPWORDS and len(t) >= 2]
+
+
+def _bm25_score_docs(query: str, docs: list[str]) -> list[float]:
+    """
+    Hitung BM25 score untuk tiap dokumen terhadap query.
+    Return list scores dengan panjang sama seperti docs.
+    
+    Fallback ke semua-nol jika rank_bm25 tidak tersedia.
+    """
+    try:
+        from rank_bm25 import BM25Okapi
+    except ImportError:
+        return [0.0] * len(docs)
+
+    tokenized_docs = [_bm25_tokenize(d) for d in docs]
+    tokenized_query = _bm25_tokenize(query)
+
+    if not tokenized_query or not any(tokenized_docs):
+        return [0.0] * len(docs)
+
+    bm25   = BM25Okapi(tokenized_docs)
+    scores = bm25.get_scores(tokenized_query)
+    return scores.tolist()
+
+
+def _reciprocal_rank_fusion(
+    cosine_distances : list[float],
+    bm25_scores      : list[float],
+    k                : int   = 60,
+    bm25_weight      : float = 0.3,
+) -> list[float]:
+    """
+    Reciprocal Rank Fusion (RRF) untuk gabung cosine similarity + BM25.
+
+    Formula per dokumen:
+        rrf_score = (1 / (rank_cosine + k)) + bm25_weight * (1 / (rank_bm25 + k))
+
+    Parameter:
+        k           — konstanta smoothing RRF. Default 60 sesuai paper asli.
+        bm25_weight — bobot relatif BM25 vs cosine. Default 0.3 (70% cosine,
+                      30% BM25) karena cosine embedding lebih kaya semantik,
+                      BM25 hanya sebagai keyword booster.
+    
+    Return: list RRF scores (lebih tinggi = lebih baik).
+    """
+    n = len(cosine_distances)
+    if n == 0:
+        return []
+
+    # Rank cosine: distance kecil = lebih relevan = rank rendah (dimulai 1)
+    cosine_order = sorted(range(n), key=lambda i: cosine_distances[i])
+    cosine_rank  = [0] * n
+    for rank, idx in enumerate(cosine_order):
+        cosine_rank[idx] = rank + 1
+
+    # Rank BM25: score besar = lebih relevan = rank rendah
+    bm25_order = sorted(range(n), key=lambda i: bm25_scores[i], reverse=True)
+    bm25_rank  = [0] * n
+    for rank, idx in enumerate(bm25_order):
+        bm25_rank[idx] = rank + 1
+
+    # Fusi
+    rrf_scores = [
+        (1.0 / (cosine_rank[i] + k))
+        + bm25_weight * (1.0 / (bm25_rank[i] + k))
+        for i in range(n)
+    ]
+    return rrf_scores
+
+
 class LongTermMemoryManager:
 
     def __init__(
@@ -86,9 +209,6 @@ class LongTermMemoryManager:
         self.daily_dir.mkdir(parents=True, exist_ok=True)
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.memory_md_path.exists():
-            self.memory_md_path.write_text(_DEFAULT_MEMORY_MD, encoding="utf-8")
-
         self._chroma_client = chromadb.PersistentClient(
             path=str(self.chroma_dir),
             settings=Settings(anonymized_telemetry=False),
@@ -99,6 +219,16 @@ class LongTermMemoryManager:
             embedding_function=self._ef,
             metadata={"hnsw:space": "cosine"},
         )
+
+        # Cek apakah rank_bm25 tersedia — log sekali saat init
+        try:
+            import rank_bm25  # noqa
+            self._bm25_available = True
+            print("  [LTM] BM25 hybrid: rank_bm25 tersedia ✓")
+        except ImportError:
+            self._bm25_available = False
+            print("  [LTM] BM25 hybrid: rank_bm25 tidak tersedia, fallback cosine-only")
+            print("  [LTM] Install dengan: pip install rank_bm25")
 
     # ──────────────────────────────────────
     # EMBEDDING
@@ -352,17 +482,34 @@ class LongTermMemoryManager:
     def search(
         self,
         query         : str,
-        n_results     : int  = None,
-        memory_type   : str  = None,
-        min_importance: int  = None,
-        label         : str  = None,   # filter by label (dari FactExtractor v6)
-        date_from     : str  = None,
-        date_to       : str  = None,
+        n_results     : int   = None,
+        memory_type   : str   = None,
+        min_importance: int   = None,
+        label         : str   = None,
+        date_from     : str   = None,
+        date_to       : str   = None,
+        use_mmr       : bool  = True,
+        mmr_lambda    : float = 0.6,
+        use_bm25      : bool  = True,   # v4.2.0: BM25 hybrid toggle
+        bm25_weight   : float = 0.3,    # v4.2.0: bobot BM25 vs cosine di RRF
     ) -> list[dict]:
         """
-        Semantic search dengan optional filter.
-        Return dict sekarang include field 'label' — fallback ke memory_type
-        jika metadata tidak punya label (data lama sebelum v6).
+        Semantic search dengan BM25 hybrid + MMR re-ranking (v4.2.0).
+
+        Pipeline:
+          1. ChromaDB cosine fetch top (n * fetch_multiplier) kandidat
+          2. Hitung BM25 score untuk kandidat yang sama
+          3. Fusi via Reciprocal Rank Fusion (RRF) → sorted by combined score
+          4. MMR re-rank untuk diversifikasi dan anti-noise duplikat
+          5. Return top-n
+
+        Parameter baru v4.2.0:
+          use_bm25    — aktifkan BM25 hybrid (default True). False = perilaku v4.1.0.
+          bm25_weight — proporsi BM25 di RRF. 0.3 = 70% cosine, 30% BM25.
+                        Naikkan ke 0.5 jika keyword exact match lebih penting.
+
+        Backward compatible: kalau rank_bm25 tidak terinstall, otomatis
+        fallback ke cosine-only tanpa error.
         """
         n     = n_results or self.top_k
         total = self._collection.count()
@@ -387,9 +534,25 @@ class LongTermMemoryManager:
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
+        # ── Tentukan fetch_k ──────────────────────────────────────────
+        # Ambil lebih banyak untuk BM25+MMR punya cukup kandidat.
+        # GPU path (dipanggil dari main_ui.py dengan n_results = top_k * 4)
+        # sudah pass n_results besar — tidak double-multiply.
+        # CPU path juga sudah pass n_results dari main_ui.py.
+        # Jika dipanggil langsung (e.g. test), multiply di sini.
+        if use_bm25 and self._bm25_available:
+            fetch_multiplier = 4 if use_mmr else 2
+        elif use_mmr:
+            fetch_multiplier = 3
+        else:
+            fetch_multiplier = 1
+
+        fetch_k = min(n * fetch_multiplier, total)
+
         kwargs = {
-            "query_texts": [query],
-            "n_results"  : min(n, total),
+            "query_texts" : [query],
+            "n_results"   : fetch_k,
+            "include"     : ["documents", "metadatas", "distances", "embeddings"],
         }
         if where:
             kwargs["where"] = where
@@ -399,21 +562,79 @@ class LongTermMemoryManager:
         except Exception:
             return []
 
+        docs       = results["documents"][0]
+        metas      = results["metadatas"][0]
+        distances  = results["distances"][0]
+        embeddings = results.get("embeddings", [[]])[0]
+
+        if not docs:
+            return []
+
+        # ── BM25 + RRF fusion (v4.2.0) ───────────────────────────────
+        # Hanya jalan kalau use_bm25=True AND rank_bm25 tersedia.
+        # Jika tidak tersedia: lanjut ke MMR dengan urutan cosine biasa.
+        if use_bm25 and self._bm25_available:
+            bm25_scores = _bm25_score_docs(query, docs)
+            rrf_scores  = _reciprocal_rank_fusion(
+                cosine_distances = distances,
+                bm25_scores      = bm25_scores,
+                bm25_weight      = bm25_weight,
+            )
+            # Sort by RRF score descending
+            sorted_idx = sorted(range(len(docs)), key=lambda i: rrf_scores[i], reverse=True)
+            docs       = [docs[i]       for i in sorted_idx]
+            metas      = [metas[i]      for i in sorted_idx]
+            distances  = [distances[i]  for i in sorted_idx]
+            embeddings = [embeddings[i] for i in sorted_idx] if embeddings is not None and len(embeddings) > 0 else embeddings
+
+        # ── MMR re-ranking ────────────────────────────────────────────
+        # Pilih n dokumen yang paling relevan DAN paling beragam.
+        if use_mmr and embeddings is not None and len(embeddings) > 0 and len(docs) > n:
+            import numpy as np
+
+            def cos_sim(a, b):
+                a, b = np.array(a), np.array(b)
+                denom = (np.linalg.norm(a) * np.linalg.norm(b))
+                return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+            relevances   = [1 - d for d in distances]
+            selected_idx = []
+            remaining    = list(range(len(docs)))
+
+            while len(selected_idx) < n and remaining:
+                if not selected_idx:
+                    best = max(remaining, key=lambda i: relevances[i])
+                else:
+                    def mmr_score(i):
+                        rel = relevances[i]
+                        max_sim = max(
+                            cos_sim(embeddings[i], embeddings[j])
+                            for j in selected_idx
+                        )
+                        return mmr_lambda * rel - (1 - mmr_lambda) * max_sim
+                    best = max(remaining, key=mmr_score)
+
+                selected_idx.append(best)
+                remaining.remove(best)
+
+            docs      = [docs[i]      for i in selected_idx]
+            metas     = [metas[i]     for i in selected_idx]
+            distances = [distances[i] for i in selected_idx]
+        else:
+            docs      = docs[:n]
+            metas     = metas[:n]
+            distances = distances[:n]
+
         return [
             {
                 "content"    : doc,
                 "memory_type": meta.get("memory_type", "fact"),
-                # 'label' dari FactExtractor v6, fallback ke memory_type untuk data lama
                 "label"      : meta.get("label", meta.get("memory_type", "episodic")),
                 "importance" : meta.get("importance", 5),
                 "date"       : meta.get("date", ""),
                 "distance"   : round(dist, 4),
             }
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            )
+            for doc, meta, dist in zip(docs, metas, distances)
         ]
 
     def search_episodic_by_period(
@@ -446,6 +667,7 @@ class LongTermMemoryManager:
             "top_k"         : self.top_k,
             "chroma_dir"    : str(self.chroma_dir),
             "device"        : self.device,
+            "bm25_available": self._bm25_available,
         }
 
 
@@ -458,26 +680,3 @@ def _clear_gpu_cache():
             torch.cuda.empty_cache()
     except ImportError:
         pass
-
-
-# ── Default MEMORY.md template ─────────────────────────────────────
-
-_DEFAULT_MEMORY_MD = """\
-# User Profile
----
-
-## Identitas
-- [2026-01-01] nama: Rifki
-- [2026-01-01] lokasi: Bandung, Jawa Barat
-- [2026-01-01] pekerjaan: Mahasiswa
-
----
-
-## Notes / Memory (knowledge pribadi)
-
----
-
-## Project Aktif
-
----
-"""

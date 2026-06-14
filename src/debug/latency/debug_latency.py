@@ -174,6 +174,8 @@ class TtsChunkInfo:
     text:         str    # preview teks chunk (maks 45 char, ASCII only)
     synthesis_ms: float
     seq:          int
+    rvc_ms:       float = 0.0   # waktu RVC conversion saja (0.0 = RVC tidak aktif)
+    play_ms:      float = 0.0   # waktu playback audio ke speaker
 
 
 @dataclass
@@ -235,13 +237,24 @@ class LatencyRecord:
     @property
     def e2e_ms(self) -> float:
         if self.had_tts and self.t_first_tts_done:
-            first_synth = self.tts_chunks[0].synthesis_ms if self.tts_chunks else 0.0
-            return self.t_first_tts_done - first_synth - self.t_turn_start
+            # t_first_tts_done = timestamp absolut saat chunk TTS pertama selesai
+            # cukup kurangi dengan t_turn_start — tidak perlu kurangi synthesis_ms
+            return max(0.0, self.t_first_tts_done - self.t_turn_start)
         return max(0.0, self.t_llm_done - self.t_turn_start)
 
     @property
     def total_tts_ms(self) -> float:
         return sum(c.synthesis_ms for c in self.tts_chunks)
+
+    @property
+    def total_rvc_ms(self) -> Optional[float]:
+        """None kalau RVC tidak aktif di turn ini (semua chunk rvc_ms == 0)."""
+        total = sum(c.rvc_ms for c in self.tts_chunks)
+        return total if total > 0.0 else None
+
+    @property
+    def total_play_ms(self) -> float:
+        return sum(c.play_ms for c in self.tts_chunks)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -296,11 +309,14 @@ class LatencyTracker:
     def mark_llm_done(self):
         self._rec.t_llm_done = self._now_ms()
 
-    def mark_tts_chunk(self, chunk_text: str, synthesis_ms: float):
+    def mark_tts_chunk(self, chunk_text: str, synthesis_ms: float, rvc_ms: float = 0.0, play_ms: float = 0.0):
         """
         Catat satu chunk TTS.
         Emoji dan karakter non-ASCII di-strip dari preview agar
         lebar kolom ASCII-art tidak meleset.
+
+        rvc_ms:  waktu RVC conversion saja (0.0 = RVC tidak aktif).
+        play_ms: waktu playback audio ke speaker.
         """
         self._tts_seq += 1
         now = self._now_ms()
@@ -308,7 +324,6 @@ class LatencyTracker:
         # Hapus non-ASCII (emoji, dsb.) sebelum dijadikan preview
         clean = _NON_ASCII_RE.sub("", chunk_text).strip()
         if not clean and chunk_text.strip():
-            # Teks ada tapi semua non-ASCII — beri keterangan jumlah karakter
             clean = f"[{len(chunk_text.strip())} non-ASCII chars]"
         preview = (clean[:45] + "...") if len(clean) > 45 else clean
 
@@ -316,6 +331,8 @@ class LatencyTracker:
             text         = preview,
             synthesis_ms = synthesis_ms,
             seq          = self._tts_seq,
+            rvc_ms       = rvc_ms,
+            play_ms      = play_ms,
         ))
 
         if self._rec.t_first_tts_done is None:
@@ -475,7 +492,15 @@ def log_latency_report(rec: LatencyRecord, mode_label: str = ""):
         for c in rec.tts_chunks:
             _row(f'  Chunk {c.seq}  "{c.text}"')
             _row("    synthesis", _fmt_ms(c.synthesis_ms))
+            if c.rvc_ms > 0.0:
+                _row("    rvc conv ", _fmt_ms(c.rvc_ms))
+            if c.play_ms > 0.0:
+                _row("    playback ", _fmt_ms(c.play_ms))
         _row("  Total TTS synthesis", _fmt_ms(rec.total_tts_ms))
+        if rec.total_rvc_ms is not None:
+            _row("  Total RVC conversion", _fmt_ms(rec.total_rvc_ms))
+        if rec.total_play_ms > 0.0:
+            _row("  Total playback     ", _fmt_ms(rec.total_play_ms))
 
     # ── Tokens ───────────────────────────────────────────────────
     _mid()

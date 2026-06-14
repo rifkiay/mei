@@ -166,6 +166,8 @@ class TurnLogger:
                 "tps"           : record.tps,
                 "e2e_ms"        : record.e2e_ms,
                 "total_tts_ms"  : record.total_tts_ms,
+                "total_rvc_ms"  : record.total_rvc_ms,
+                "total_play_ms" : record.total_play_ms,
             },
 
             # ── Pre-processing breakdown (nama step → durasi ms) ──
@@ -177,6 +179,8 @@ class TurnLogger:
                     "seq"         : c.seq,
                     "text"        : c.text,
                     "synthesis_ms": c.synthesis_ms,
+                    "rvc_ms"      : c.rvc_ms,
+                    "play_ms"     : c.play_ms,
                 }
                 for c in record.tts_chunks
             ],

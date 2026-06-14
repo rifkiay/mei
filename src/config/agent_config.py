@@ -38,12 +38,12 @@ MEMORY_CONFIG = {
     'storage_dir'     : './../storage/memory',
     'collection_name' : 'rifki_episodic',
     'embedding_model' : 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2',
-    'top_k'           : 5,
+    'top_k'           : 10,
 
     # Trigger
     'max_recent_messages'  : 5,
-    'max_longterm_memories': 5,
-    'extract_every_n_msgs' : 1,              # chroma 
+    'max_longterm_memories': 5,              # jumlah yang di ambil dari chroma ke sytem   
+    'extract_every_n_msgs' : 1,              # chroma extract
     'daily_summary_on_exit': True,
 }
 
@@ -60,29 +60,11 @@ LLM_CONFIG = {
     },
 }
 
-
 # ==========================================
 # CLASSIFIER CONFIGURATION
 # ==========================================
-# Classifier dipakai oleh FactExtractor untuk menentukan label percakapan
-# sebelum diputuskan perlu disimpan ke memori atau tidak.
-#
-# Cara kerja:
-#   "st" → ST cosine similarity
-#          Reuse model sentence-transformers/paraphrase-multilingual-mpnet-base-v2
-#          yang sudah di-load oleh ChromaDB — tidak ada model baru yang di-load.
-#          Teks percakapan di-encode jadi vektor, lalu dicari kandidat label
-#          yang paling mirip via cosine similarity.
-#          Lebih stabil untuk teks Indonesia pendek, hemat VRAM.
-#
-#   nama HuggingFace model → NLI zero-shot pipeline
-#          Load model NLI baru via transformers.pipeline().
-#          Cocok jika ingin akurasi lebih tinggi dan VRAM tidak jadi masalah.
-#          Contoh: "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
-#
 CLASSIFIER_CONFIG = {
-    # "model": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",  # reuse paraphrase-multilingual-mpnet-base-v2 dari ChromaDB
-    "model": "st",  # reuse paraphrase-multilingual-mpnet-base-v2 dari ChromaDB
+    "model": "st",  # reuse paraphrase-multilingual-mpnet-base-v2 dari ChromaDB (cosine similiarty)
 }
 
 # ==========================================
@@ -91,8 +73,8 @@ CLASSIFIER_CONFIG = {
 
 RVC_CONFIG = RVCConfig(
     host          = "http://127.0.0.1:7865",
-    model_name    = "model_name",
-    index_path    = r"E:\skripsi pendekatan openclaw\agent_qwen\rvc\assets\weights\model_name.index",
+    model_name    = "zetaTest",
+    index_path    = r"E:\skripsi pendekatan openclaw\agent_qwen\rvc\assets\weights\added_IVF462_Flat_nprobe_1_zetaTest_v2.index",
     pitch         = 7,
     f0_method     = "rmvpe",
     index_rate    = 0.85,

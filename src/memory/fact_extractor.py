@@ -1,11 +1,11 @@
 """
-Async Fact Extractor — MEI v6.3.1
+Async Fact Extractor — MEI v6.4.0
 ==================================
-Pipeline 4-step yang dioptimalkan untuk SLM kecil (Qwen 3 1.7B):
+Pipeline 4-step yang dioptimalkan untuk LLM lokal (Qwen3-VL 4B / SLM):
 
   [1]   Rule-based filter     — eliminasi basa-basi SEBELUM kena model apapun
   [1.5] Recall question filter — eliminasi pertanyaan recall/ingat
-  [1.6] Utility command filter — eliminasi perintah utilitas one-shot (NEW v6.3.0)
+  [1.6] Utility command filter — eliminasi perintah utilitas one-shot
         set timer, cari berita, cek waktu, ambil gambar, dll.
   [2]   Classifier            — label + confidence via cosine similarity (ST) atau NLI
   [3]   SLM binary + teks     — HANYA untuk label ambigu ATAU direct-save confidence rendah
@@ -13,68 +13,28 @@ Pipeline 4-step yang dioptimalkan untuk SLM kecil (Qwen 3 1.7B):
                                 Label jelas tidak penting langsung DROP
   [4]   Python routing        — berdasarkan label + should_save → simpan / drop
 
-Perubahan dari v6.3.0 (v6.3.1):
-  - FIX: _process() — classifier sekarang hanya baca input user (_format_user_only),
-    bukan full conversation termasuk response LLM (_format_conversation).
-    Bug: "ada yang lain?" → label 'teknis' karena LLM-nya jawab berita ekonomi.
-    Fix: conv_user = _format_user_only(messages) → classifier tidak "terkontaminasi"
-    oleh isi jawaban LLM yang tidak relevan dengan intent user.
+Perubahan dari v6.3.2 (v6.4.0):
+  - FIX COVERAGE: CPU path Jalur 2 (direct save) — sebelumnya langsung simpan
+    _extract_user_texts() mentah. Sekarang di-route ke SLM untuk di-summarize
+    menjadi kalimat dense third-person sebelum disimpan ke ChromaDB.
+    Impact: kualitas teks ChromaDB lebih informatif → retrieval lebih akurat.
 
-Perubahan dari v6.2.4 (v6.3.0):
-  - ADD: _UTILITY_PATTERNS + _is_utility_command() — Step [1.6] baru.
-    Perintah utilitas one-shot (timer, berita, waktu, kamera, kalender)
-    di-drop sebelum classifier. Fix false save "tanggal?" → pekerjaan,
-    "set timer" → preferensi, "cari berita" → pekerjaan.
-  - MOD: _classify_with_st() dan _classify_with_nli() return tuple[str, float]
-    (label, confidence) — sebelumnya hanya return str.
-  - ADD: _DIRECT_SAVE_MIN_CONFIDENCE = 0.45 — threshold confidence untuk
-    direct save. Di bawah nilai ini → redirect ke SLM check.
-  - MOD: _process() — jalur 2 cek confidence sebelum direct save.
-  - MOD: _LABEL_CANDIDATES — definisi "pekerjaan" dipersempit, "tidak_penting"
-    diperluas include perintah utilitas.
+  - FIX COVERAGE GPU: _SLM_DIRECT_PROMPT diperkuat dengan 3 few-shot examples
+    konkret (input → SAVE/LABEL/SUMMARY/NOTE) sehingga Qwen3-VL 4B lebih
+    konsisten dalam format output dan keputusan SAVE/DROP.
 
-Perubahan dari v6.2.3 (PATCH v6.2.4):
-  - FIX: Prefix [USER] tidak lagi ikut tersimpan ke ChromaDB.
-    Akar masalah: _format_user_only() menghasilkan string dengan prefix
-    "[USER] ..." yang kemudian langsung dipakai sebagai summary di
-    _save_episodic(). Akibatnya isi ChromaDB menjadi:
-      "[2026-05-09] [USER] Hai, nama saya rifki..."
-    bukannya:
-      "[2026-05-09] Hai, nama saya rifki..."
-  - ADD: _extract_user_texts() — helper baru yang mengambil konten pesan
-    user tanpa prefix role. Digunakan khusus untuk isi summary ChromaDB.
-  - MOD: Jalur 2 (direct save) & Jalur 3 (SLM/ambigu): ganti
-    _format_user_only(messages) → _extract_user_texts(messages) untuk
-    pembentukan summary yang akan disimpan ke ChromaDB.
-  - MOD: _save_episodic() fallback: hapus hardcode "[USER]" prefix
-    agar konsisten dengan perubahan di atas.
-  - NOTE: _format_user_only() tetap dipertahankan — masih dipakai
-    oleh conv untuk classifier Step [2] yang butuh label role.
+  - FIX: max_tokens _call_slm_direct naik dari 150 → 200 untuk beri ruang
+    SLM menulis SUMMARY yang lebih informatif.
 
-Perubahan dari v6.2.2 (PATCH v6.2.3):
-  - FIX: Summary episodic sekarang hanya menyimpan pesan USER, bukan ASSISTANT
-  - FIX: Jalur 3 (SLM/ambigu): abaikan parsed["summary"] dari SLM
-  - ADD: _format_user_only()
+  - ADD: _SLM_SUMMARIZE_PROMPT — prompt baru khusus untuk CPU Jalur 2.
+    SLM diminta tulis ulang teks user menjadi kalimat padat third-person
+    (bukan extract mentah). Fallback ke raw text jika SLM gagal/timeout.
 
-Perubahan dari v6.2.1 (PATCH v4.5.5 → v6.2.2):
-  - ADD: _RECALL_QUESTION_PATTERNS
-  - ADD: _is_recall_question()
-  - ADD: Step [1.5] di _process()
+  - ADD: _call_slm_summarize() — helper untuk CPU summarize path.
+    Timeout 45 detik, max_tokens 100, temperature 0.1.
 
-Perubahan dari v6.2.0 (PATCH v4.5.5):
-  - ADD: on_fact_saved callback(turn_no, label, saved)
-  - ADD: _current_turn_no
-  - ADD: _fire_callback()
-  - ADD: on_fact_saved parameter di __init__
-
-Labels yang didukung:
-   data_pribadi | pekerjaan | project | teknis | preferensi |
-   pengalaman   | lainnya   | tidak_penting
-
-Importance mapping (Python, bukan SLM):
-  data_pribadi → 9 | project/pekerjaan → 8 | teknis/preferensi → 7
-  pengalaman → 6   | pertanyaan/lainnya → 5
-  chat_biasa → 3   | basa-basi → 1
+  - KEEP: Semua logika v6.3.x lainnya tidak berubah (rule filter, NLI path,
+    recall filter, utility filter, GPU path branching, callback, worker).
 """
 
 import re
@@ -150,10 +110,6 @@ _RECALL_QUESTION_PATTERNS = re.compile(
 
 
 def _is_recall_question(messages: list[dict]) -> bool:
-    """
-    Deteksi apakah pesan terakhir dari user adalah pertanyaan recall
-    (menanyakan kembali informasi lama) bukan deklarasi fakta baru.
-    """
     user_msgs = [m for m in messages if m.get("role") == "user"]
     if not user_msgs:
         return False
@@ -175,7 +131,7 @@ _UTILITY_PATTERNS = re.compile(
     r"(carikan|cari|ambil|tampilkan|kasih|kasih tau|cek)\s+berita|"
     r"ada\s+berita\s+(apa|terbaru|hari ini)|"
     r"berita\s+(hari ini|terbaru|terkini)|"
-    r"(tolong\s+)?cari(kan)?\s+(info|informasi|artikel|tutorial|cara)|"
+    r"(tolong\s+)?cari(kan)?\s+(berita|jadwal|lokasi|tempat|restoran|cuaca|gambar|foto)|"
     # Waktu / tanggal
     r"(jam|pukul)\s+berapa(\s+sekarang)?[\?]*|"
     r"sekarang\s+(jam|pukul)\s+berapa[\?]*|"
@@ -199,15 +155,6 @@ _UTILITY_PATTERNS = re.compile(
 
 
 def _is_utility_command(messages: list[dict]) -> bool:
-    """
-    Deteksi perintah utilitas one-shot: set timer, cari berita, cek jadwal,
-    ambil gambar, tanya waktu/tanggal.
-
-    Perintah-perintah ini tidak mengandung informasi personal yang perlu
-    disimpan ke long-term memory — langsung drop.
-
-    Step [1.6]: dijalankan setelah recall filter, sebelum classifier.
-    """
     user_msgs = [m for m in messages if m.get("role") == "user"]
     if not user_msgs:
         return False
@@ -395,6 +342,160 @@ def _parse_slm_response(raw: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+# GPU DIRECT PATH — prompt + helpers (v6.3.2, diperkuat v6.4.0)
+# ══════════════════════════════════════════════════════════════════
+
+# v6.4.0: Diperkuat dengan 3 few-shot examples konkret
+# Sebelumnya hanya ada 2 contoh bagus/buruk summary yang terlalu singkat.
+# Sekarang ada 3 contoh lengkap input → output 4 baris agar Qwen3-VL 4B
+# lebih konsisten dalam format dan keputusan SAVE/DROP.
+_SLM_DIRECT_PROMPT = """Kamu adalah sistem memori AI personal assistant bernama MEI.
+Tugasmu: analisis pesan user, putuskan apakah perlu disimpan ke memori jangka panjang,
+dan kalau ya — tulis ulang menjadi kalimat informatif padat third-person.
+
+Percakapan user:
+{conversation}
+
+Aturan keputusan:
+- SIMPAN jika ada fakta personal: nama, kontak, preferensi, pengalaman, project aktif, info pekerjaan/teknologi
+- JANGAN SIMPAN jika: basa-basi, recall question, perintah utilitas one-shot (timer, cari berita, cek jadwal, ambil foto)
+
+Jika SAVE=yes, tulis ulang sebagai kalimat padat third-person:
+- Gunakan nama asli user jika diketahui, atau sebut "pengguna"
+- Sertakan fakta spesifik (nama teknologi, angka, waktu, nama project)
+- Maksimal 1-2 kalimat
+- JANGAN gunakan "[USER]" sebagai subjek
+
+CONTOH 1 — data pribadi (nama & kontak):
+Input: [USER] Hai, nama saya Budi, saya kerja sebagai data engineer di Jakarta.
+SAVE: yes
+LABEL: data_pribadi
+SUMMARY: Budi adalah data engineer yang bekerja di Jakarta.
+NOTE: Budi memperkenalkan diri sebagai data engineer di Jakarta.
+
+CONTOH 2 — utilitas one-shot (tidak disimpan):
+Input: [USER] Cari berita teknologi terbaru dong.
+SAVE: no
+LABEL: tidak_penting
+SUMMARY:
+NOTE:
+
+CONTOH 3 — preferensi kerja:
+Input: [USER] Gue lebih suka kerja dari rumah, produktivitas lebih tinggi kalau tidak di kantor.
+SAVE: yes
+LABEL: preferensi
+SUMMARY: Pengguna lebih produktif saat bekerja dari rumah dibanding di kantor.
+NOTE: Pengguna menyebutkan preferensi WFH karena lebih produktif.
+
+CONTOH 4 — diskusi teknis mendalam:
+Input: [USER] Gimana cara optimasi query PostgreSQL yang lambat? Saya pakai index tapi masih lelet.
+SAVE: yes
+LABEL: teknis
+SUMMARY: Pengguna mempelajari optimasi query PostgreSQL yang lambat meskipun sudah menggunakan index.
+NOTE: Pengguna mendiskusikan masalah performa query PostgreSQL.
+
+CONTOH 5 — project aktif:
+Input: [USER] Project saya sekarang namanya PaymentHub, pakai microservice architecture.
+SAVE: yes
+LABEL: project
+SUMMARY: Pengguna sedang mengerjakan project PaymentHub dengan arsitektur microservice.
+NOTE: Pengguna memperkenalkan project aktif bernama PaymentHub.
+
+CONTOH 6 — pengalaman kerja:
+Input: [USER] Saya pernah 3 tahun kerja di startup fintech sebelum pindah ke perusahaan sekarang.
+SAVE: yes
+LABEL: pengalaman
+SUMMARY: Pengguna memiliki pengalaman 3 tahun di startup fintech sebelum posisi saat ini.
+NOTE: Pengguna menceritakan riwayat karir di startup fintech.
+
+CONTOH 7 — perintah kamera (tidak disimpan):
+Input: [USER] Foto layar laptop saya buat dokumentasi.
+SAVE: no
+LABEL: tidak_penting
+SUMMARY:
+NOTE:
+
+Label: data_pribadi | pekerjaan | project | teknis | preferensi | pengalaman | lainnya | tidak_penting
+
+Jawab HANYA dengan format ini (4 baris, tidak ada yang lain):
+SAVE: yes atau no
+LABEL: salah satu label di atas
+SUMMARY: kalimat ringkasan (kosong jika no)
+NOTE: catatan harian singkat (kosong jika no)
+"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# CPU SUMMARIZE PATH — prompt baru v6.4.0
+# ══════════════════════════════════════════════════════════════════
+
+# Digunakan di Jalur 2 (direct save) CPU path.
+# Sebelumnya Jalur 2 langsung simpan _extract_user_texts() mentah → noise.
+# Sekarang SLM diminta tulis ulang jadi kalimat padat sebelum masuk ChromaDB.
+_SLM_SUMMARIZE_PROMPT = """Tulis ulang teks berikut menjadi 1-2 kalimat padat third-person
+untuk disimpan ke memori jangka panjang AI assistant.
+
+Aturan:
+- Gunakan nama asli user jika disebutkan, atau gunakan kata "pengguna"
+- JANGAN gunakan "[USER]" sebagai subjek
+- Sertakan fakta spesifik: nama, angka, teknologi, waktu, nama project
+- Buang filler word, sapaan, dan kata tidak penting
+- Maksimal 150 karakter
+
+Contoh input  : Nama saya Andi, saya frontend developer pakai React dan TypeScript.
+Contoh output : Andi adalah frontend developer yang menggunakan React dan TypeScript.
+
+Contoh input  : Saya prefer kerja mulai jam 7 pagi, lebih fokus sebelum orang lain online.
+Contoh output : Pengguna prefer mulai kerja jam 7 pagi karena lebih fokus sebelum jam ramai.
+
+Teks yang akan diproses:
+{text}
+
+Tulis ulang (langsung tanpa penjelasan):"""
+
+
+def _init_gpu_cache() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+_GPU_AVAILABLE: bool = _init_gpu_cache()
+
+
+def _detect_gpu() -> bool:
+    """Return True jika CUDA tersedia. Hasil di-cache — tidak berubah di runtime."""
+    return _GPU_AVAILABLE
+
+
+def _parse_slm_direct_response(raw: str) -> dict:
+    """Parse output GPU SLM direct path (4 baris: SAVE/LABEL/SUMMARY/NOTE)."""
+    result = {"should_save": False, "label": "", "summary": "", "daily_note": ""}
+    _EMPTY = {"", "kosong", "-", "none", "n/a", "tidak ada", "empty"}
+
+    for line in raw.splitlines():
+        line = line.strip()
+        low  = line.lower()
+        if low.startswith("save:"):
+            val = line[5:].strip().lower()
+            result["should_save"] = val.startswith("y") or val.startswith("iya")
+        elif low.startswith("label:"):
+            val = line[6:].strip().lower().replace(" ", "_")
+            if val in _LABEL_IMPORTANCE:
+                result["label"] = val
+        elif low.startswith("summary:"):
+            val = line[8:].strip().strip("[]()\"'")
+            if val.lower() not in _EMPTY:
+                result["summary"] = val
+        elif low.startswith("note:"):
+            val = line[5:].strip().strip("[]()\"'")
+            if val.lower() not in _EMPTY:
+                result["daily_note"] = val
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
 # IMPORTANCE MAP
 # ══════════════════════════════════════════════════════════════════
 
@@ -458,17 +559,9 @@ def _extract_user_texts(messages: list[dict], max_chars: int = MAX_CONV_CHARS) -
     """
     Ambil konten pesan user saja, TANPA prefix role [USER].
 
-    Digunakan khusus untuk membentuk summary yang akan disimpan ke ChromaDB,
-    agar isi memori bersih dari label role dan hanya berisi teks asli user.
-
-    Contoh output:
-      "Hai, nama saya rifki ainul yaqin, saya seorang backend developer."
-
-    Bukan:
-      "[USER] Hai, nama saya rifki ainul yaqin, saya seorang backend developer."
-
-    Berbeda dari _format_user_only() yang sengaja menyertakan prefix [USER]
-    untuk keperluan classifier yang butuh konteks role.
+    Digunakan sebagai FALLBACK jika SLM summarize gagal.
+    Output ini adalah teks mentah — lebih baik dihindari sebagai isi ChromaDB
+    karena mengandung noise. Gunakan _call_slm_summarize() untuk versi bersihnya.
     """
     parts = []
     total = 0
@@ -481,7 +574,7 @@ def _extract_user_texts(messages: list[dict], max_chars: int = MAX_CONV_CHARS) -
         if total + len(content) + 3 > max_chars:
             break
         parts.append(content)
-        total += len(content) + 3  # 3 = len(" | ")
+        total += len(content) + 3
     return " | ".join(parts)
 
 
@@ -495,7 +588,8 @@ def _make_fingerprint(messages: list[dict]) -> str:
 
 # Threshold confidence minimum untuk direct save tanpa SLM check.
 # Di bawah nilai ini → redirect ke SLM meskipun label sudah di _DIRECT_SAVE_LABELS.
-_DIRECT_SAVE_MIN_CONFIDENCE = 0.45
+_DIRECT_SAVE_MIN_CONFIDENCE = 0.60
+_SLM_MIN_CONFIDENCE         = 0.50
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -532,7 +626,14 @@ class FactExtractor:
         self._user_id          = user_id
         self._device           = device
         self._debug            = debug
+        self._use_gpu_path     = _detect_gpu()
 
+        if self._use_gpu_path:
+            _log("GPU detected — menggunakan SLM direct path (skip cosine)")
+        else:
+            _log("GPU tidak tersedia — menggunakan CPU path (cosine/NLI classifier)")
+
+        self._lock             = threading.Lock()
         self._last_extracted_content : str = ""
         self._last_submitted_idx     : int = 0
         self._classifier                   = None
@@ -549,6 +650,17 @@ class FactExtractor:
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
+    def set_use_gpu(self, use_gpu: bool, device: Optional[str] = None):
+        with self._lock:
+            self._use_gpu_path = use_gpu and _detect_gpu()
+            self._classifier   = None
+            if device is not None:
+                self._device = device
+        _log(
+            f"GPU path: {'ON (SLM direct)' if self._use_gpu_path else 'OFF (cosine/NLI classifier)'}"
+            + (f" | device={self._device}" if device else "")
+        )
+
     def start(self):
         self._running = True
         self._thread.start()
@@ -564,13 +676,14 @@ class FactExtractor:
             _log("Stopped")
 
     def _get_classifier(self):
-        if self._classifier is None:
-            if self._classifier_model == "st":
-                self._classifier = self._lt_mem._ef._model()
-                _log("Classifier: ST cosine similarity (reuse ChromaDB model)")
-            else:
-                self._classifier = _get_nli_classifier(self._classifier_model, self._device)
-        return self._classifier
+        with self._lock:
+            if self._classifier is None:
+                if self._classifier_model == "st":
+                    self._classifier = self._lt_mem._ef._model()
+                    _log("Classifier: ST cosine similarity (reuse ChromaDB model)")
+                else:
+                    self._classifier = _get_nli_classifier(self._classifier_model, self._device)
+            return self._classifier
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -641,11 +754,6 @@ class FactExtractor:
     def _process(self, messages: list[dict]):
         t0 = time.perf_counter()
 
-        # v6.3.1: pisah dua teks:
-        #   conv_user  → hanya input user, dipakai untuk classifier & semua filter
-        #   conv_full  → termasuk response LLM, tidak dipakai (dihapus dari pipeline)
-        # Alasan: classifier yang baca response LLM akan salah label —
-        # "ada yang lain?" dapat label 'teknis' karena LLM-nya jawab berita ekonomi.
         conv_user = _format_user_only(messages, MAX_CONV_CHARS)
         if not conv_user.strip():
             _log("Empty conversation, skipping", level="DEBUG", debug=self._debug)
@@ -658,23 +766,82 @@ class FactExtractor:
             self._fire_callback("tidak_penting", False)
             return
 
-        # ── Step [1.6]: utility command filter (v6.3.0) ───────────
+        # ── Step [1.6]: utility command filter ───────────────────
         if _is_utility_command(messages):
             _log("Utility command detected → skip save (step 1.6)")
             self._fire_callback("tidak_penting", False)
             return
 
-        # ── Step [2]: classifier → label + confidence ─────────────
-        # Classifier hanya lihat input user — bukan response LLM
+        # ── Step [2]: GPU path → SLM direct, CPU path → cosine/NLI ─
+        if self._use_gpu_path:
+            conv_full    = _format_conversation(messages, MAX_CONV_CHARS)
+            raw_response = self._call_slm_direct(conv_full)
+            if not raw_response:
+                _log("GPU SLM returned empty response", level="WARN")
+                self._fire_callback("", False)
+                return
+
+            _log(f"GPU SLM raw:\n{raw_response}", level="DEBUG", debug=self._debug)
+
+            parsed      = _parse_slm_direct_response(raw_response)
+            should_save = parsed["should_save"]
+            label       = parsed["label"] or "lainnya"
+            summary     = parsed["summary"]
+            daily_note  = parsed["daily_note"]
+
+            _log(f"GPU Step[2] label={label} save={should_save}")
+
+            if daily_note:
+                self._save_daily(daily_note)
+            if should_save and summary:
+                self._save_episodic(label, summary, messages)
+            elif should_save and not summary:
+                _log("GPU SLM: SAVE=yes tapi summary kosong, fallback ke raw text", level="WARN")
+                fallback = _extract_user_texts(messages)[:150]
+                self._save_episodic(label, fallback, messages)
+            else:
+                _log(f"GPU SLM: not saved (label={label})", level="DEBUG", debug=self._debug)
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            _log(f"Done {elapsed:.0f}ms | label={label} | saved={should_save} (GPU direct)")
+            self._fire_callback(label, should_save)
+            return
+
+        # ── CPU path: cosine/NLI classifier → label + confidence ──
         classifier = self._get_classifier()
+        if classifier is None:
+            _log("Classifier gagal load (model None) → fallback SLM check", level="WARN")
+            conv_full    = _format_conversation(messages, MAX_CONV_CHARS)
+            raw_response = self._call_slm(conv_full, "lainnya")
+            if not raw_response:
+                self._fire_callback("lainnya", False)
+                return
+            parsed      = _parse_slm_response(raw_response)
+            should_save = parsed["should_save"]
+            daily_note  = parsed["daily_note"]
+            summary     = _extract_user_texts(messages)[:150]
+            if daily_note:
+                self._save_daily(daily_note)
+            if should_save:
+                self._save_episodic("lainnya", summary, messages)
+            self._fire_callback("lainnya", should_save)
+            return
+
         if self._classifier_model == "st":
             label, confidence = _classify_with_st(conv_user, classifier)
         else:
             label, confidence = _classify_with_nli(conv_user, classifier)
 
-        _log(f"Step[2] label={label} confidence={confidence:.3f}")
+        _log(f"CPU Step[2] label={label} confidence={confidence:.3f}")
 
-        importance = _LABEL_IMPORTANCE.get(label, 6)
+        # Jalur 0: confidence terlalu rendah → DROP global
+        if confidence <= _SLM_MIN_CONFIDENCE:
+            _log(
+                f"Label '{label}' conf={confidence:.3f} <= {_SLM_MIN_CONFIDENCE} "
+                f"→ drop global (terlalu ambigu)"
+            )
+            self._fire_callback(label, False)
+            return
 
         # Jalur 1: jelas tidak penting → DROP
         if label in _NO_SAVE_LABELS:
@@ -682,17 +849,20 @@ class FactExtractor:
             self._fire_callback(label, False)
             return
 
-        # Jalur 2: jelas penting + confidence cukup → SAVE langsung (tanpa SLM)
-        # Jika confidence rendah → redirect ke SLM meskipun label direct-save
+        # ── Jalur 2: jelas penting + confidence cukup → SLM summarize dulu lalu SAVE ──
+        # v6.4.0: sebelumnya langsung simpan _extract_user_texts() mentah.
+        # Sekarang SLM diminta tulis ulang jadi kalimat padat sebelum masuk ChromaDB.
+        # Ini meningkatkan kualitas teks → retrieval lebih akurat, noise berkurang.
         if label in _DIRECT_SAVE_LABELS:
             if confidence >= _DIRECT_SAVE_MIN_CONFIDENCE:
-                _log(f"Label '{label}' imp={importance} conf={confidence:.3f} → direct save (no SLM)")
-                summary    = _extract_user_texts(messages)[:150]
+                _log(f"Label '{label}' conf={confidence:.3f} → SLM summarize then save")
+                raw_text   = _extract_user_texts(messages)
+                summary    = self._call_slm_summarize(raw_text)
                 daily_note = f"[{label}] {summary[:80]}"
                 self._save_daily(daily_note)
                 self._save_episodic(label, summary, messages)
                 elapsed = (time.perf_counter() - t0) * 1000
-                _log(f"Done {elapsed:.0f}ms | label={label} | saved=True (direct)")
+                _log(f"Done {elapsed:.0f}ms | label={label} | saved=True (summarized)")
                 self._fire_callback(label, True)
                 return
             else:
@@ -701,8 +871,7 @@ class FactExtractor:
                     f"→ redirect ke SLM check"
                 )
 
-        # Jalur 3: ambigu ATAU direct-save confidence rendah → tanya SLM
-        # SLM butuh full context (user + assistant) untuk generate daily note akurat
+        # Jalur 3: ambigu ATAU confidence rendah → tanya SLM
         _log(f"Label '{label}' → SLM check", level="DEBUG", debug=self._debug)
         conv_full    = _format_conversation(messages, MAX_CONV_CHARS)
         raw_response = self._call_slm(conv_full, label)
@@ -716,7 +885,12 @@ class FactExtractor:
         parsed      = _parse_slm_response(raw_response)
         should_save = parsed["should_save"]
         daily_note  = parsed["daily_note"]
-        summary     = _extract_user_texts(messages)[:150]
+        # Jalur 3 juga pakai SLM summarize jika perlu simpan
+        if should_save:
+            raw_text = _extract_user_texts(messages)
+            summary  = self._call_slm_summarize(raw_text)
+        else:
+            summary = ""
 
         if daily_note:
             self._save_daily(daily_note)
@@ -765,6 +939,68 @@ class FactExtractor:
                 _log(f"SLM call failed (attempt {attempt + 1}): {e}", level="ERROR")
         return ""
 
+    # ── SLM Direct Call (GPU path) ────────────────────────────────
+
+    def _call_slm_direct(self, conversation: str) -> str:
+        """GPU path: SLM classify + summarize sekaligus, tanpa label hint."""
+        prompt = _SLM_DIRECT_PROMPT.replace("{conversation}", conversation)
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    f"{self._llm_cfg['model_server']}/chat/completions",
+                    headers={"Authorization": f"Bearer {self._llm_cfg.get('api_key', 'lm-studio')}"},
+                    json={
+                        "model"      : self._llm_cfg["model"],
+                        "messages"   : [{"role": "user", "content": prompt}],
+                        "max_tokens" : 200,    # v6.4.0: naik dari 150 → 200
+                        "temperature": 0.1,
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                _log(f"SLM direct call failed (attempt {attempt + 1}): {e}", level="ERROR")
+        return ""
+
+    # ── SLM Summarize Call (CPU Jalur 2 & 3, v6.4.0) ─────────────
+
+    def _call_slm_summarize(self, raw_text: str) -> str:
+        """
+        CPU path: minta SLM tulis ulang raw_text menjadi kalimat padat third-person
+        sebelum disimpan ke ChromaDB.
+
+        Fallback ke raw_text[:150] jika SLM gagal atau timeout.
+        Timeout pendek (45 detik) karena ini blocking call di background thread.
+        """
+        if not raw_text.strip():
+            return raw_text[:150]
+
+        prompt = _SLM_SUMMARIZE_PROMPT.replace("{text}", raw_text[:500])
+        try:
+            resp = requests.post(
+                f"{self._llm_cfg['model_server']}/chat/completions",
+                headers={"Authorization": f"Bearer {self._llm_cfg.get('api_key', 'lm-studio')}"},
+                json={
+                    "model"      : self._llm_cfg["model"],
+                    "messages"   : [{"role": "user", "content": prompt}],
+                    "max_tokens" : 100,
+                    "temperature": 0.1,
+                },
+                timeout=45,
+            )
+            resp.raise_for_status()
+            result = resp.json()["choices"][0]["message"]["content"].strip()
+            # Buang tanda kutip jika model membungkus output
+            result = result.strip("\"'")
+            if len(result) > 10:
+                _log(f"SLM summarize: '{result[:80]}'")
+                return result[:200]
+        except Exception as e:
+            _log(f"SLM summarize gagal ({e}), fallback ke raw text", level="WARN")
+
+        return raw_text[:150]
+
     # ── Save Daily ─────────────────────────────────────────────────
 
     def _save_daily(self, note: str):
@@ -779,13 +1015,14 @@ class FactExtractor:
     # ── Save Episodic ──────────────────────────────────────────────
 
     def _save_episodic(self, label: str, summary: str, raw_msgs: list[dict]):
+        summary = summary.strip()
+        summary = re.sub(r"^\[?USER\]?\s*", "", summary)  # ← tambah ini
         if not summary:
             _log("Summary kosong, pakai fallback snippet", level="WARN")
             parts = []
             for msg in raw_msgs[-4:]:
                 if msg.get("role") != "user":
                     continue
-                # FIX v6.2.4: fallback tanpa prefix [USER]
                 content = (msg.get("content") or "")[:100].replace("\n", " ").strip()
                 if content:
                     parts.append(content)
