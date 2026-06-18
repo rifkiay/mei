@@ -256,6 +256,19 @@ class LongTermMemoryManager:
         print(f"  [LTM] Embedding re-init: device={device}")
         _clear_gpu_cache()
 
+    def get_embedding_model(self):
+        """
+        Return instance SentenceTransformer yang dipakai LTM/ChromaDB saat ini,
+        supaya komponen lain (mis. intent classifier ST cosine di main_ui.py)
+        bisa reuse model yang sama tanpa load model baru.
+
+        Return None kalau embedding_model="default" (DefaultEmbeddingFunction
+        ChromaDB tidak expose SentenceTransformer langsung).
+        """
+        if hasattr(self._ef, "_model"):
+            return self._ef._model()
+        return None
+
     # ──────────────────────────────────────
     # 1. MEMORY.md (READ ONLY untuk AI)
     # ──────────────────────────────────────

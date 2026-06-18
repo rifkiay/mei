@@ -726,12 +726,120 @@ def _classify_intent_llm(text: str, llm_cfg: dict) -> bool:
         return True
 
 
-def _should_search_episodic(text: str, llm_cfg: dict | None = None) -> bool:
+# ── ST cosine similarity intent classifier (v4.5.20) ──────────────────
+# Pengganti _classify_intent_llm() saat llm_cfg tidak tersedia (CPU mode).
+# Sebelumnya CPU mode selalu fallback `return False` untuk Layer 2 (ambiguous
+# keyword) karena tidak ada LLM call sama sekali → ChromaDB retrieval mati
+# total untuk semua query yang cuma match keyword ambigu (mayoritas pertanyaan
+# natural: "biasanya", "meeting", "project", "kerja", "tools", dst).
+#
+# Solusi: reuse embedding model yang SAMA dengan ChromaDB (lewat
+# lt_mem.get_embedding_model()) — tidak ada model tambahan yang dimuat —
+# lalu bandingkan cosine similarity user_input terhadap dua kelompok kalimat
+# anchor: RECALL (butuh memori personal) vs GENERAL (pertanyaan umum/teknis/
+# one-shot). Pola sama seperti _classify_with_st() di fact_extractor.py.
+
+_INTENT_RECALL_ANCHORS = [
+    "Kamu ingat stack teknologi yang aku pakai?",
+    "Jadwal meeting rutin aku kapan?",
+    "Jam berapa aku biasanya mulai kerja?",
+    "Project apa yang sedang aku kerjakan sekarang?",
+    "Berapa tahun pengalaman kerja aku di bidang ini?",
+    "Dimana aku kerja dan apa posisi aku?",
+    "Tools atau teknologi apa yang biasa aku pakai sehari-hari?",
+    "Gimana kebiasaan atau rutinitas kerja aku?",
+    "Apa preferensi jadwal kerja aku?",
+    "Apa yang pernah aku ceritakan soal pekerjaan aku?",
+    "Kapan biasanya aku demo progress ke klien?",
+    "Apa yang lagi aku kerjakan terkait project ini?",
+]
+
+_INTENT_GENERAL_ANCHORS = [
+    "Apa itu Docker?",
+    "Gimana cara setup JWT?",
+    "Jelaskan cara kerja REST API.",
+    "Cuaca hari ini gimana?",
+    "Apa perbedaan SQL dan NoSQL?",
+    "Bagaimana cara install Python?",
+    "Apa kabar?",
+    "Tolong cariin berita terbaru soal AI.",
+    "Set timer 10 menit.",
+    "Apa itu machine learning?",
+    "Jelaskan konsep object-oriented programming.",
+    "Berapa hasil 25 dikali 4?",
+]
+
+_intent_st_cache: dict[str, bool] = {}
+_INTENT_ST_ANCHOR_CACHE: dict[int, tuple] = {}
+
+
+def _classify_intent_st(text: str, st_model) -> bool:
+    """
+    Versi ST cosine similarity dari _classify_intent_llm() — dipakai saat
+    llm_cfg tidak tersedia (CPU mode) supaya Layer 2 (ambiguous keyword)
+    tetap bisa diputuskan tanpa HTTP call ke LLM server.
+
+    Return True  = embedding query lebih mirip kelompok anchor RECALL
+                    (butuh cari ChromaDB).
+    Return False = lebih mirip kelompok anchor GENERAL, atau st_model
+                    tidak tersedia (safe fallback, no false positive).
+    """
+    if st_model is None:
+        _dbg("Intent ST: st_model None, fallback False")
+        return False
+
+    cache_key = text.strip().lower()[:120]
+    if cache_key in _intent_st_cache:
+        return _intent_st_cache[cache_key]
+
+    model_key = id(st_model)
+    if model_key not in _INTENT_ST_ANCHOR_CACHE:
+        recall_emb  = st_model.encode(
+            _INTENT_RECALL_ANCHORS, convert_to_numpy=True, show_progress_bar=False
+        )
+        general_emb = st_model.encode(
+            _INTENT_GENERAL_ANCHORS, convert_to_numpy=True, show_progress_bar=False
+        )
+        _INTENT_ST_ANCHOR_CACHE[model_key] = (recall_emb, general_emb)
+    recall_emb, general_emb = _INTENT_ST_ANCHOR_CACHE[model_key]
+
+    try:
+        text_emb = st_model.encode([text], convert_to_numpy=True, show_progress_bar=False)[0]
+
+        def _max_sim(anchor_emb):
+            norms  = np.linalg.norm(anchor_emb, axis=1) * np.linalg.norm(text_emb)
+            scores = anchor_emb @ text_emb / (norms + 1e-8)
+            return float(np.max(scores))
+
+        recall_score  = _max_sim(recall_emb)
+        general_score = _max_sim(general_emb)
+        result = recall_score > general_score
+
+        _intent_st_cache[cache_key] = result
+        _dbg(
+            f"Intent ST: '{text[:50]}' → recall={recall_score:.3f} "
+            f"general={general_score:.3f} → {'RECALL' if result else 'GENERAL'}"
+        )
+        return result
+    except Exception as e:
+        _dbg(f"Intent ST classifier gagal ({e}), fallback ke False")
+        return False
+
+
+def _should_search_episodic(
+    text     : str,
+    llm_cfg  : dict | None = None,
+    st_model         = None,
+) -> bool:
     """
     2-layer hybrid trigger:
     Layer 1 — Keyword eksplisit & regex: langsung True, zero latency.
-    Layer 2 — Keyword ambiguous: tanya LLM intent classifier dulu.
-              Kalau llm_cfg tidak tersedia, fallback ke True (safe).
+    Layer 2 — Keyword ambiguous: tanya intent classifier dulu.
+              - GPU mode (llm_cfg tersedia)  → LLM intent classifier (_classify_intent_llm).
+              - CPU mode (st_model tersedia) → ST cosine similarity classifier
+                (_classify_intent_st), reuse embedding model yang sama dengan
+                ChromaDB — tanpa HTTP call ke LLM, tanpa model tambahan.
+              - Kalau keduanya tidak tersedia → fallback False (safe).
     """
     low = text.lower()
 
@@ -751,8 +859,10 @@ def _should_search_episodic(text: str, llm_cfg: dict | None = None) -> bool:
         _dbg(f"Episodic trigger: ambiguous keyword, cek intent...")
         if llm_cfg:
             return _classify_intent_llm(text, llm_cfg)
-        # Tanpa LLM cfg (CPU mode / test) → false agar tidak false positive
-        _dbg("Episodic trigger: tidak ada llm_cfg, skip ambiguous")
+        if st_model is not None:
+            return _classify_intent_st(text, st_model)
+        # Tanpa llm_cfg & st_model → fallback aman, jangan false positive
+        _dbg("Episodic trigger: tidak ada llm_cfg & st_model, skip ambiguous")
         return False
 
     return False
@@ -1747,7 +1857,11 @@ def _process_turn(
         chroma_triggered = False
         _chroma_query_used = ""   # v4.5.18: untuk debugging
         tracker.mark_pre_step("memory_read")
-        if _should_search_episodic(user_input, llm_cfg=LLM_CONFIG if io_state.use_gpu else None):
+        if _should_search_episodic(
+            user_input,
+            llm_cfg  = LLM_CONFIG if io_state.use_gpu else None,
+            st_model = None if io_state.use_gpu else lt_mem.get_embedding_model(),
+        ):
             chroma_triggered = True
             _log(f"ChromaDB: trigger terdeteksi, mencari...")
 
