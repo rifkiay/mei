@@ -693,6 +693,12 @@ class FactExtractor:
         if _rule_based_filter(messages):
             _log("Rule-based: skip", level="DEBUG", debug=self._debug)
             return
+        if _is_recall_question(messages):
+            _log("Recall question: skip queue (step 1.5)", level="DEBUG", debug=self._debug)
+            return
+        if _is_utility_command(messages):
+            _log("Utility command: skip queue (step 1.6)", level="DEBUG", debug=self._debug)
+            return
         fingerprint = _make_fingerprint(messages)
         if fingerprint == self._last_extracted_content:
             _log("Duplicate batch, skipping", level="DEBUG", debug=self._debug)
@@ -758,18 +764,6 @@ class FactExtractor:
         if not conv_user.strip():
             _log("Empty conversation, skipping", level="DEBUG", debug=self._debug)
             self._fire_callback("", False)
-            return
-
-        # ── Step [1.5]: recall question filter ────────────────────
-        if _is_recall_question(messages):
-            _log("Recall question detected → skip save (step 1.5)")
-            self._fire_callback("tidak_penting", False)
-            return
-
-        # ── Step [1.6]: utility command filter ───────────────────
-        if _is_utility_command(messages):
-            _log("Utility command detected → skip save (step 1.6)")
-            self._fire_callback("tidak_penting", False)
             return
 
         # ── Step [2]: GPU path → SLM direct, CPU path → cosine/NLI ─
